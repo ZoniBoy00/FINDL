@@ -1,0 +1,9 @@
+playwright>=1.40.0
+requests>=2.31.0
+pywidevine>=1.8.0
+rich>=13.0.0
+click>=8.1.0
+python-dotenv>=1.0.0
+protobuf>=4.25.0
+pycryptodomex>=3.19.0
+yt-dlp>=2025.2.3
