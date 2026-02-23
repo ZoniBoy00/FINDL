@@ -19,7 +19,7 @@ class UI:
         banner_text.append(" ╚═╝     ╚═╝╚═╝  ╚═══╝╚═════╝ ╚══════╝", style="bold blue")
         
         panel = Panel(
-            Text.assemble(banner_text, "\n\n", (" Unified Video Downloader v2.1 ", "bold italic white on blue")),
+            Text.assemble(banner_text, "\n\n", (" Unified Video Downloader v0.1 ", "bold italic white on blue")),
             border_style="blue",
             box=DOUBLE_EDGE,
             padding=(1, 2)
