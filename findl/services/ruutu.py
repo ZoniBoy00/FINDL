@@ -15,6 +15,186 @@ class RuutuExtractor(BaseExtractor):
     def get_service_name(self):
         return "Ruutu"
 
+    def is_series(self, url):
+        """Checks if the URL is a series/program page."""
+        return "/ohjelmat/" in url
+
+    def get_episodes(self, url):
+        """Scrapes all episode links from a Ruutu series page, including multiple seasons."""
+        with sync_playwright() as p:
+            if not os.path.exists(SESSION_DIR): os.makedirs(SESSION_DIR)
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(user_agent=CHROME_UA)
+            
+            UI.print_step(f"Scraping Ruutu series from [underline]{url}[/underline]", "running")
+            try:
+                page.goto(url, wait_until="networkidle", timeout=60000)
+            except:
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            
+            # Click cookie consent
+            try:
+                for _ in range(2):
+                    for btn_text in ["Hyväksy", "Accept", "Salli"]: # Consent button texts: "Hyväksy" (Accept), "Salli" (Allow)
+                        btn = page.get_by_role("button", name=btn_text, exact=False)
+                        if btn.count() > 0:
+                            btn.first.click()
+                            page.wait_for_timeout(1500)
+                            break
+                    else:
+                        page.wait_for_timeout(1000)
+                        continue
+                    break
+            except: pass
+
+            episodes = []
+            seen_ids = set()
+
+            # Capture series title
+            series_title = page.evaluate("() => document.querySelector('h1')?.innerText.trim() || 'Ruutu Original'")
+            
+            # Helper to extract visible episodes
+            def extract_visible(current_season=None):
+                # Focus on the main content area
+                container = page.query_selector('.SeriesPage, main, #main-content, .SeriesEpisodes') or page
+                links = container.query_selector_all('a[href*="/video/"]')
+                
+                for link in links:
+                    href = link.get_attribute("href")
+                    if not href: continue
+                    
+                    match = re.search(r'/video/(\d+)', href)
+                    if match:
+                        video_id = match.group(1)
+                        
+                        # Try to get the cleanest title possible
+                        title = page.evaluate("""el => {
+                            // 1. Try to find a heading in the closest card
+                            let card = el.closest('div[class*="Card"], div[class*="Item"], div[class*="Episode"], [data-test*="card"]');
+                            if (card) {
+                                let h = card.querySelector('h1, h2, h3, h4, [class*="title"], [class*="Title"], [class*="heading"]');
+                                if (h && h.innerText.trim().length > 3) return h.innerText;
+                                
+                                // Alternative: look for text that looks like a title (start with number or long text)
+                                let lines = card.innerText.split('\\n').map(l => l.trim()).filter(l => l.length > 5 && !l.includes('play_circle'));
+                                if (lines.length > 0) return lines[0];
+                            }
+                            
+                            // 2. Try the link's own text
+                            let txt = el.innerText.trim();
+                            if (txt.length > 5 && !txt.includes('play_circle')) return txt;
+                            
+                            return txt;
+                        }""", link).strip()
+                        
+                        # Clean prefixes
+                        for prefix in ["Katso:", "Jatka:", "Katso tallennettu:", "Episode:", "Jakso:", "Watch:"]:
+                            if title.lower().startswith(prefix.lower()):
+                                title = title[len(prefix):].strip()
+                        
+                        title = title.replace("play_circle_outline", "").strip()
+                        if title: title = title.split("\n")[0].strip()
+                        
+                        # Fallback
+                        if not title or len(title) < 2 or title.lower() in ["katso", "jatka", "play"]:
+                            title = f"Episode {video_id}"
+
+                        # Check if we already have this ID
+                        existing_index = next((i for i, e in enumerate(episodes) if e['id'] == video_id), None)
+                        
+                        full_url = "https://www.ruutu.fi" + (href if href.startswith("/") else "/" + href)
+                        
+                        if existing_index is None:
+                            episodes.append({
+                                "id": video_id,
+                                "url": full_url,
+                                "title": title,
+                                "series": series_title,
+                                "season": current_season or "Kausi 1"
+                            })
+                            seen_ids.add(video_id)
+                        else:
+                            # If we have a weak title (like "Jakso 1") and now found a better one, update it
+                            # Also prioritize items NOT in hero
+                            is_hero = page.evaluate("el => !!el.closest('.Hero, .SeriesHero, [class*=\"Hero\"], [class*=\"hero\"]')", link)
+                            if not is_hero and (len(title) > len(episodes[existing_index]['title']) or "Episode" in episodes[existing_index]['title']):
+                                episodes[existing_index]['title'] = title
+                                episodes[existing_index]['url'] = full_url
+
+            # Scroll and check for seasons
+            # Look for season tabs/buttons
+            season_selectors = [
+                'button', 
+                '[role="tab"]',
+                '.season-selector button',
+                'a[href*="/kausi-"]'
+            ]
+            
+            season_texts = []
+            seen_names = set()
+            
+            # First, just collect the names of the seasons
+            for sel in season_selectors:
+                for el in page.query_selector_all(sel):
+                    try:
+                        txt = el.inner_text().strip()
+                        if not txt: continue
+                        txt_up = txt.upper()
+                        if ("KAUSI" in txt_up or "SEASON" in txt_up) and el.is_visible():
+                            if txt_up not in seen_names:
+                                season_texts.append(txt)
+                                seen_names.add(txt_up)
+                    except: pass
+            
+            if season_texts:
+                UI.print_step(f"Found [bold cyan]{len(season_texts)}[/bold cyan] seasons: {', '.join(season_texts)}", "info")
+                
+                for txt in season_texts:
+                    try:
+                        UI.print_step(f"Expanding [bold]{txt}[/bold]...", "info")
+                        
+                        # Use JavaScript to find and click the element by text
+                        # This is much more reliable than Playwright's built-in click which can be picky about visibility/overlays
+                        clicked = page.evaluate("""(text) => {
+                            const elements = Array.from(document.querySelectorAll('button, [role="tab"], a'));
+                            const target = elements.find(el => {
+                                const elText = el.innerText.trim().toUpperCase();
+                                return elText === text.toUpperCase() || elText.includes(text.toUpperCase());
+                            });
+                            if (target) {
+                                target.scrollIntoView({ block: 'center' });
+                                target.click();
+                                return true;
+                            }
+                            return false;
+                        }""", txt)
+                        
+                        if clicked:
+                            page.wait_for_timeout(2500) # Give more time for content to switch
+                            
+                            # Extract episodes for this season
+                            last_count = -1
+                            for _ in range(3):
+                                current_count = len(episodes)
+                                extract_visible(current_season=txt)
+                                if len(episodes) == current_count: break # No new episodes found
+                                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                                page.wait_for_timeout(1500)
+                        else:
+                            UI.print_step(f"Could not find element for {txt}", "warn")
+                            
+                    except Exception as e:
+                        UI.print_step(f"Error clicking season {txt}: {str(e)}", "warn")
+            else:
+                # Just scroll and extract if no season buttons found
+                for _ in range(5):
+                    extract_visible()
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    page.wait_for_timeout(1500)
+
+            browser.close()
+            return episodes
+
     def extract(self, url):
         with sync_playwright() as p:
             if not os.path.exists(SESSION_DIR): os.makedirs(SESSION_DIR)
@@ -116,13 +296,13 @@ class RuutuExtractor(BaseExtractor):
             
             # Interactive Play
             try:
-                for btn_text in ["Hyväksy", "Kyllä", "Accept", "Hyväksy kaikki", "Salli"]:
+                for btn_text in ["Hyväksy", "Kyllä", "Accept", "Hyväksy kaikki", "Salli"]: # Consent and confirmation: "Hyväksy" (Accept), "Kyllä" (Yes), "Salli" (Allow)
                     if page.get_by_role("button", name=btn_text, exact=False).count() > 0:
                         page.get_by_role("button", name=btn_text, exact=False).first.click()
                         page.wait_for_timeout(2000)
                         break
                 
-                for sel in [".play-button", "button.play", ".player-play-button", "[aria-label='Toista']", ".vjs-big-play-button"]:
+                for sel in [".play-button", "button.play", ".player-play-button", "[aria-label='Toista']", ".vjs-big-play-button"]: # "Toista" = Play
                     btn = page.locator(sel)
                     if btn.count() > 0:
                         btn.first.click()
@@ -219,7 +399,7 @@ class RuutuExtractor(BaseExtractor):
                         subs.append({
                             "url": full_url,
                             "language": "fi", 
-                            "label": "Ohjelmatekstitys"
+                            "label": "Program subtitles"
                         })
                 
                 # HLS (.m3u8) support
@@ -241,7 +421,7 @@ class RuutuExtractor(BaseExtractor):
                                     name = name_match.group(1) if name_match else lang
                                     characteristics = char_match.group(1) if char_match else ""
                                     
-                                    # Label Detection
+                                    # Labelin tunnistus
                                     label = name
                                     if "public.accessibility.transcribes-spoken-dialog" in characteristics:
                                         label = f"{name} (Ohjelmatekstitys)"

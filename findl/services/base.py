@@ -7,6 +7,9 @@ from urllib.parse import urljoin, urlparse, parse_qs
 from ..config import DEFAULT_HEADERS
 
 class BaseExtractor(ABC):
+    """
+    Base class for all service extractors.
+    """
     @abstractmethod
     def extract(self, url):
         pass
@@ -14,6 +17,12 @@ class BaseExtractor(ABC):
     @abstractmethod
     def get_service_name(self):
         pass
+
+    def is_series(self, url):
+        return False
+
+    def get_episodes(self, url):
+        return []
 
     def _resolve_url(self, url):
         if "gnsnpaw.com" in url or "decision" in url:
@@ -55,8 +64,8 @@ class BaseExtractor(ABC):
             # --- 1. PRIORITY: Check current content for Keys/PSSH ---
             
             # A. HLS Key / Session Key (Katsomo Master/Media playlists)
-            # Use a more liberal regex to catch everything between data: and the following quote or comma
-            match = re.search(r'#EXT-X-(?:SESSION-)?KEY:.*URI="data:text/plain;base64,(.*?)"', content, re.I)
+            # Look for PSSH data in data-URI format
+            match = re.search(r'#EXT-X-(?:SESSION-)?KEY:.*URI="data:[^;"]*?(?:;base64)?,([^"]+)"', content, re.I)
             if match:
                 pssh = match.group(1).split(',')[0].strip()
                 logging.debug(f"[BASE] Found PSSH via HLS Key: {pssh[:40]}...")
@@ -70,7 +79,7 @@ class BaseExtractor(ABC):
                     return pssh
                 except: pass
 
-            # B. XML / JSON PSSH Patterns (DASH/MPD)
+            # B. XML / JSON PSSH patterns (DASH/MPD)
             patterns = [
                 r'<(?:[a-zA-Z0-9]+:)?pssh[^>]*>(.*?)</(?:[a-zA-Z0-9]+:)?pssh>', 
                 r'cenc:pssh>(.*?)</cenc:pssh>',
@@ -83,18 +92,22 @@ class BaseExtractor(ABC):
                     logging.debug(f"[BASE] Found PSSH via DASH Pattern: {pssh[:40]}...")
                     return pssh
 
-            # --- 2. FALLBACK: Recursion / Deep Scan ---
-
             # HLS Master Playlist -> Recurse into children
             if "#EXT-X-STREAM-INF" in content:
                 lines = content.splitlines()
                 urls = []
                 for i, line in enumerate(lines):
-                    if "#EXT-X-STREAM-INF" in line and i + 1 < len(lines):
-                        urls.append(urljoin(url, lines[i+1].strip()))
+                    if "#EXT-X-STREAM-INF" in line:
+                        # Find the next non-empty line that isn't a comment
+                        j = i + 1
+                        while j < len(lines) and (not lines[j].strip() or lines[j].startswith("#")):
+                            j += 1
+                        if j < len(lines):
+                            urls.append(urljoin(url, lines[j].strip()))
                 
-                # Check up to 5 child playlists
-                for child_url in urls[:5]:
+                # Check up to 10 child playlists (more aggressive)
+                for child_url in urls[:10]:
+                    logging.debug(f"[BASE] Scanning child playlist: {child_url}")
                     found = self.get_pssh_from_manifest(child_url, cookies, headers)
                     if found: return found
 

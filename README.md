@@ -1,37 +1,42 @@
 # FINDL - Finnish Stream Downloader
 
-Unified video downloader for Finnish streaming services, specializing in **MTV Katsomo**, **Ruutu**, and **Yle Areena**.
+Unified video downloader for Finnish streaming services, specializing in **MTV Katsomo**, **Ruutu**, **Yle Areena**, and **Viaplay**.
 
 Built with **Python**, utilizing **Playwright** for intelligent extraction, **N_m3u8DL-RE** for high-performance downloading, and **yt-dlp** for specialized HLS/DASH services.
 
-## 🚀 Features
+## 🚀 Key Features
 
-### MTV Katsomo
+### 📺 Series & Season Support
+- **Automatic Crawling**: Provide a series URL, and FINDL will find all seasons and episodes.
+- **Bulk Selection**: Choose to download individual episodes, ranges (e.g., `1-5`), or the entire series at once.
+- **Smart Metadata**: Automatically extracts series titles, season numbers, and episode names.
+- **Clean Naming**: Enforces a standard naming convention (`01 - Episode Name.mkv`) for perfect media server compatibility (Plex/Kodi).
+
+### 📂 Automatic Organization
+- **Smart Folders**: Automatically creates a directory structure: `Downloads / [Series Name] / [Season X] / [Episode].mkv`.
+- **Sanitized Paths**: Automatically cleans titles of system-illegal characters.
+
+### 🇫🇮 Supported Services
+
+#### MTV Katsomo
 - **Full Video & Audio**: Downloads highest quality video and audio streams.
-- **Advanced Subtitles**: 
-  - Automatically fetches standard Finnish subtitles.
-  - **Program Subtitles (Ohjelmatekstitys)**: Specialized support for tracks often missed by other tools (`qag` streams).
-- **DRM Handling**: Automatically extracts PSSH and acquires Widevine L3 keys via header emulation.
+- **Advanced Subtitles**: Automatically fetches standard Finnish subtitles and **Program Subtitles**.
+- **DRM Handling**: Automatically extracts PSSH and acquires Widevine L3 keys.
 
-### Ruutu
-- **Free & Premium**: Supports downloading free and Ruutu+ content (requires valid cookies/session).
-- **Ultra-Strict DRM**: Bypasses Axinom's strict header checks and session validation (CMCD) using specialized logic.
-- **Subtitle Extraction**: Automatically parses and labels program subtitles from HLS/DASH streams.
+#### Ruutu
+- **Series Archiving**: Supports full series and season downloads for Ruutu+.
+- **Ultra-Strict DRM**: Bypasses Axinom's strict header checks and session validation (CMCD).
+- **Subtitle Extraction**: Automatically parses and labels program subtitles.
 
-### Yle Areena
-- **yt-dlp Engine**: Uses a specialized high-performance engine for Yle-specific HLS/DASH streams.
-- **Parallel Downloading**: Optimized fragment downloads for maximum speed.
-- **Metadata**: Automatically embeds chapters and rich metadata.
+#### Yle Areena
+- **Single Videos & Series**: Handles both movie URLs and series pages interchangeably.
 - **Windows Optimized**: Custom "Temp-and-Move" strategy to prevent file locking issues (`WinError 32`).
+- **Clean Lists**: Intelligently filters out recommendations and language selectors.
 
-## 🛠️ Tech Stack & Architecture
-
-1.  **Extractors (`findl/services/`)**: Playwright navigates to the content, handles consent/cookies, and extracts manifests and PSSH data.
-2.  **DRM Handler (`findl/core/drm.py`)**: Interacts with license servers using the Widevine L3 device.
-3.  **Downloader (`findl/core/downloader.py`)**: 
-    - **N_m3u8DL-RE Strategy**: Default for DRM-protected content (MTV, Ruutu).
-    - **yt-dlp Strategy**: Default for Yle Areena, featuring beautiful `rich` progress bars and ETA.
-4.  **Subtitle Manager**: Orchestrates the conversion of multiple formats (WebVTT, HLS-segments) into standard SRT.
+#### Viaplay (Beta)
+- **Metadata Extraction**: Extracts rich metadata including production year and synopsis.
+- **SAMI Subtitles**: Custom converter for Viaplay's SAMI subtitle format to standard SRT.
+- **Series Discovery**: Crawls seasons and episodes using Playwright.
 
 ## 📋 Prerequisites
 
@@ -39,7 +44,7 @@ Built with **Python**, utilizing **Playwright** for intelligent extraction, **N_
 - **Python 3.10+** is required.
 
 ### 2. Required Binaries
-The project relies on these excellent external tools. Please ensure they are in your system PATH or placed in the `bin/` directory:
+The project relies on these external tools. Please ensure they are in your system PATH or placed in the `bin/` directory:
 - [**N_m3u8DL-RE**](https://github.com/nilaoda/N_m3u8DL-RE): Stream downloader and muxer.
 - [**Shaka Packager**](https://github.com/shaka-project/shaka-packager): Required for DRM decryption.
 - [**ffmpeg**](https://ffmpeg.org/): Essential for muxing and subtitle conversion.
@@ -47,7 +52,6 @@ The project relies on these excellent external tools. Please ensure they are in 
 ### 3. Widevine Device
 A valid Widevine L3 device file (`.wvd`) is required for DRM decryption. 
 - Place your `device.wvd` in the project root.
-- See `.env.example` for manual configuration options.
 
 ## 📦 Installation
 
@@ -75,22 +79,6 @@ python main.py "URL_TO_VIDEO"
 - `--title "<name>"`: Manually set the output filename.
 - `--no-subs`: Skip subtitle processing.
 - `--pssh <pssh>`: Manually provide PSSH if extraction fails.
-
-## ⚙️ Configuration
-The tool can be configured via environment variables or a `.env` file. Copy the example to get started:
-```bash
-cp .env.example .env
-```
-Key settings:
-- `WVD_PATH`: Path to your `.wvd` file.
-- `OUTPUT_DIR`: Default downloads folder.
-
-## ❓ Troubleshooting
-
-- **WinError 32 (File in use)**: 
-  - The tool uses a temporary directory to avoid this. If it persists, ensure your video player or Antivirus isn't locking files in `downloads` or `_tmp_findl`.
-- **403 Forbidden (Yle Areena)**: The tool uses `yt-dlp` which handles Akamai tokens automatically. Ensure your `yt-dlp` is up to date (`pip install -U yt-dlp`).
-- **DRM License Failure**: Indicates expired cookies or a blacklisted WVD. Clear the `findl_sessions` directory and ensure your `device.wvd` is fresh.
 
 ## ⚠️ Disclaimer
 This tool is for educational and personal use only. The author is not responsible for any misuse. Respect the Terms of Service of the streaming providers and copyright laws.

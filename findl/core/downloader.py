@@ -237,6 +237,7 @@ class Downloader:
         """Identify program/CC tracks that need extra attention."""
         lbl = (sub.get('label') or "").lower()
         lang = (sub.get('language') or "").lower()
+        # "ohjelma" = program, "hoh" = hard of hearing
         return any(x in lang for x in ["qag"]) or any(x in lbl for x in ["ohjelma", "program", "hoh", "cc"])
 
     def _extract_subs_from_folder(self, temp_title, clean_title):
@@ -245,7 +246,7 @@ class Downloader:
             if f.startswith(temp_title) and f.endswith(".srt"):
                 suffix = "fi"
                 if "qag" in f.lower() or "ohjelma" in f.lower():
-                    suffix = "fi.ohjelmatekstitys"
+                    suffix = "fi.program_subtitles"
                 elif "fi" not in f.split("."):
                      parts = f.replace(temp_title, "").strip(".").split(".")
                      if parts: suffix = f"fi.{parts[0]}"

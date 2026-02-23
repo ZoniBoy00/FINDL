@@ -14,8 +14,149 @@ class KatsomoExtractor(BaseExtractor):
     def get_service_name(self):
         return "MTV Katsomo"
 
+    def is_series(self, url):
+        """Checks if the URL is a series/program page."""
+        return "/ohjelma/" in url
 
-    
+    def get_episodes(self, url):
+        """
+        Scrapes episode links and titles from a series page.
+        Returns a list of dicts: [{'id': ..., 'url': ..., 'title': ...}]
+        """
+        with sync_playwright() as p:
+            if not os.path.exists(SESSION_DIR): os.makedirs(SESSION_DIR)
+            
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(user_agent=CHROME_UA)
+            
+            UI.print_step(f"Scraping episodes from [underline]{url}[/underline]", "running")
+            # Use networkidle to ensure dynamic content is loaded
+            try:
+                page.goto(url, wait_until="networkidle", timeout=60000)
+            except:
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            
+            # Click cookie consent - try multiple times and ways
+            try:
+                for _ in range(3):
+                    # Selectors for cookie consent: "Hyväksy kaikki" = "Accept all"
+                    for sel in ["#accept-all-button", "text='Hyväksy kaikki'", "button:has-text('Hyväksy')", "button:has-text('OK')"]:
+                        if page.locator(sel).count() > 0:
+                            page.locator(sel).first.click()
+                            page.wait_for_timeout(1000)
+                            break
+                    else:
+                        page.wait_for_timeout(1000)
+                        continue
+                    break
+            except: pass
+
+            # Extra wait for safety
+            page.wait_for_timeout(2000)
+
+            episodes = []
+            seen_ids = set()
+
+            # Capture series title
+            series_title = page.evaluate("() => document.querySelector('h1, [class*=\"series-title\"], [class*=\"program-title\"]')?.innerText.trim() || 'Katsomo Sarja'")
+            
+            # Helper to extract visible episodes
+            def extract_visible(current_season=None):
+                links = page.query_selector_all('a[href*="/video/"]')
+                for link in links:
+                    href = link.get_attribute("href")
+                    if not href: continue
+                    
+                    match = re.search(r'/video/([a-z0-9]{15,})', href)
+                    if match:
+                        video_id = match.group(1)
+                        if video_id not in seen_ids:
+                            title = link.inner_text().strip()
+                            if not title or len(title) < 3:
+                                title = page.evaluate("el => { \
+                                    let p = el.closest('div'); \
+                                    if(!p) return ''; \
+                                    let h = p.querySelector('h1, h2, h3, h4, span[class*=\"title\"]'); \
+                                    return h ? h.innerText : p.innerText; \
+                                }", link).strip()
+                            
+                            if title:
+                                title = title.split("\n")[0].strip()
+                            
+                            if not title or len(title) < 2:
+                                title = f"Episode {video_id[:8]}"
+
+                            full_url = href
+                            if not href.startswith("http"):
+                                full_url = "https://www.mtv.fi" + (href if href.startswith("/") else "/" + href)
+                            
+                            episodes.append({
+                                "id": video_id,
+                                "url": full_url,
+                                "title": title,
+                                "series": series_title,
+                                "season": current_season or "Season 1"
+                            })
+                            seen_ids.add(video_id)
+
+            # Look for season selection
+            try:
+                # Katsomo seasons are often in buttons, list items or spans that act as buttons
+                # We'll use a robust JS approach similar to Ruutu
+                season_texts = page.evaluate("""() => {
+                    const elements = Array.from(document.querySelectorAll('button, [role="tab"], li, span, div'));
+                    const seen = new Set();
+                    const results = [];
+                    elements.forEach(el => {
+                        const txt = el.innerText.trim();
+                        // "Kausi" = "Season" in Finnish
+                        if (/^Kausi \\d+$/i.test(txt) && !seen.has(txt.toUpperCase())) {
+                            results.push(txt);
+                            seen.add(txt.toUpperCase());
+                        }
+                    });
+                    return results;
+                }""")
+                
+                # If no clear seasons found, try a more relaxed search
+                if not season_texts:
+                    season_texts = page.evaluate("""() => {
+                        const elements = Array.from(document.querySelectorAll('button, [role="tab"]'));
+                        return elements
+                            .map(el => el.innerText.trim())
+                            .filter(txt => /Kausi \\d+/i.test(txt)) // Match Finnish "Kausi X" (Season X)
+                            .filter((v, i, a) => a.indexOf(v) === i);
+                    }""")
+
+                if season_texts and len(season_texts) > 1:
+                    UI.print_step(f"Found [bold cyan]{len(season_texts)}[/bold cyan] seasons: {', '.join(season_texts)}", "info")
+                    for txt in season_texts:
+                        try:
+                            UI.print_step(f"Expanding [bold]{txt}[/bold]...", "info")
+                            clicked = page.evaluate("""(text) => {
+                                const elements = Array.from(document.querySelectorAll('button, [role="tab"], li, span'));
+                                const target = elements.find(el => el.innerText.trim().toUpperCase() === text.toUpperCase());
+                                if (target) {
+                                    target.scrollIntoView({ block: 'center' });
+                                    target.click();
+                                    return true;
+                                }
+                                return false;
+                            }""", txt)
+                            
+                            if clicked:
+                                page.wait_for_timeout(2500)
+                                extract_visible(current_season=txt)
+                        except: pass
+                else:
+                    extract_visible()
+            except Exception as e:
+                logging.debug(f"[KATSOMO] Season detection error: {e}")
+                extract_visible()
+            
+            browser.close()
+            return episodes
+
     def extract(self, url):
         """
         Main extraction logic for MTV Katsomo.
@@ -71,12 +212,31 @@ class KatsomoExtractor(BaseExtractor):
                         data = response.json()
                         json_str = response.text()
                         
-                        # Sniff PSSH from JSON (some manifests are clean, but JSON has it)
-                        matches = re.findall(r'"pssh":"([^"]{40,})"', json_str)
-                        for m in matches:
-                            if m not in result["psshs"]:
-                                result["psshs"].append(m)
-                                logging.info(f"[KATSOMO] PSSH found in playback JSON")
+                        # Deep PSSH search in JSON response
+                        def find_pssh_recursive(obj):
+                            if isinstance(obj, dict):
+                                for k, v in obj.items():
+                                    if k.lower() in ["pssh", "psshvalue", "widevinepssh"] and isinstance(v, str) and len(v) > 40:
+                                        if v not in result["psshs"]:
+                                            result["psshs"].append(v)
+                                            logging.info(f"[KATSOMO] PSSH found in field: {k}")
+                                    else:
+                                        find_pssh_recursive(v)
+                            elif isinstance(obj, list):
+                                for item in obj:
+                                    find_pssh_recursive(item)
+                        
+                        find_pssh_recursive(data)
+                        
+                        # Fallback: Look for base64 pssh-box anywhere
+                        if not result["psshs"]:
+                            # cHNzaA is 'pssh' in base64
+                            b64_matches = re.findall(r'"([a-zA-Z0-9+/=]{60,})"', json_str)
+                            for candidate in b64_matches:
+                                if "cHNzaA" in candidate:
+                                    if candidate not in result["psshs"]:
+                                        result["psshs"].append(candidate)
+                                        logging.info(f"[KATSOMO] PSSH found via base64 deep scan")
 
                         pb = data.get("playbackItem", {}) or data.get("playback", {})
                         if isinstance(pb, list): pb = pb[0]
@@ -120,6 +280,9 @@ class KatsomoExtractor(BaseExtractor):
                     
                     # Sniff PSSH from License Challenge Body if possible
                     body = response.request.post_data_buffer
+                    if not body and response.request.post_data:
+                        body = response.request.post_data.encode()
+                        
                     if body:
                         try:
                             msg = SignedMessage()
@@ -144,14 +307,14 @@ class KatsomoExtractor(BaseExtractor):
             
             # Interactive Play (Force video load to trigger network requests)
             try:
-                # Click Cookie Banner
+                # Click Cookie Banner: "Hyväksy kaikki" = "Accept all"
                 for sel in ["#accept-all-button", "#consent_prompt_submit", "text='Hyväksy kaikki'"]:
                     if page.locator(sel).count() > 0:
                         page.locator(sel).first.click()
                         page.wait_for_timeout(1000)
                         break
                 
-                # Click Play Button
+                # Click Play Button: "Katso" = "Watch"
                 for sel in ["button.play", "[data-test='play-button']", "text='Katso'", ".vjs-big-play-button"]:
                     if page.locator(sel).count() > 0:
                         page.locator(sel).first.click()
@@ -166,16 +329,21 @@ class KatsomoExtractor(BaseExtractor):
                 result["title"] = re.sub(r'[^\w\s-]', '', result["title"]).strip().replace(" ", "_")
             except: pass
 
-            # Final Wait Loop
+            # Final wait loop
             UI.print_step("Waiting for license data... (Login now if needed)", "running")
             start = time.time()
             max_wait = 120 
             
-            while time.time() - start < max_wait:
-                if result["manifest_url"] and result["license_url"]:
+            while (time.time() - start < max_wait):
+                # Wait for manifest, license, and PSSH
+                if result["manifest_url"] and result["license_url"] and result["psshs"]:
                     page.wait_for_timeout(2000)
                     break
                 
+                # Fallback: If we have manifest and license but no PSSH after 30s, let deep scan try
+                if result["manifest_url"] and result["license_url"] and (time.time() - start) > 30:
+                    break
+                    
                 if (time.time() - start) > 15 and not result["license_url"]:
                     try:
                         page.evaluate("if(document.querySelector('video')) document.querySelector('video').play()")
@@ -187,7 +355,11 @@ class KatsomoExtractor(BaseExtractor):
             if not result["psshs"] and result["manifest_url"]:
                 UI.print_step("Sniffing failed, deep scanning manifest...", "info")
                 cur_cookies = {c['name']: c['value'] for c in context.cookies()}
-                headers = {"Origin": "https://www.mtv.fi", "Referer": "https://www.mtv.fi/"}
+                headers = {
+                    "User-Agent": CHROME_UA,
+                    "Origin": "https://www.mtv.fi", 
+                    "Referer": "https://www.mtv.fi/"
+                }
                 pssh = self.get_pssh_from_manifest(result["manifest_url"], cur_cookies, headers)
                 if pssh:
                     result["psshs"].append(pssh)

@@ -35,7 +35,7 @@ class SubtitleManager:
                 
                 if not url: continue
 
-                # Hyväksytään fi, qag tai labelit joissa lukee ohjelma/CC
+                # Accept fi, qag or labels containing program/CC
                 is_target = any(l in lang for l in self.languages)
                 is_hoh = label and any(h in label.lower() for h in ["ohjelma", "program", "hoh", "cc"])
                 
@@ -45,11 +45,11 @@ class SubtitleManager:
                 lang_clean = re.sub(r'[^\w]', '', lang)
                 safe_label = re.sub(r'[^\w]', '', str(label))
                 
-                # Asetetaan lopullinen SRT-polku
+                # Set final SRT path
                 filename_base = f"extsub_{idx}_{lang_clean}_{safe_label}_{timestamp}"
                 filepath_srt = os.path.abspath(os.path.join(self.output_dir, filename_base + ".srt"))
 
-                # Tunnistetaan onko kyseessä segmentoitu tekstitys (m3u8) by checking extension or content
+                # Identify if it's segmented subtitles (m3u8) by checking extension or content
                 is_segmented = ".m3u8" in url
                 if not is_segmented:
                      try:
@@ -64,8 +64,20 @@ class SubtitleManager:
                     else:
                         logging.warning(f"[SUBS] Tool download failed for {url}")
                         continue
+                elif ".sami" in url or ".smi" in url:
+                    # SAMI (Viaplay)
+                    temp_sami = os.path.join(self.output_dir, filename_base + ".sami")
+                    if self._download_file(url, temp_sami):
+                        if self._convert_sami_to_srt(temp_sami, filepath_srt):
+                            downloaded_files.append(filepath_srt)
+                            try: os.remove(temp_sami)
+                            except: pass
+                        else:
+                            downloaded_files.append(temp_sami)
+                    else:
+                        continue
                 else:
-                    # Tavallinen VTT-tiedosto
+                    # Standard VTT file
                     temp_vtt = os.path.join(self.output_dir, filename_base + ".vtt")
                     if self._download_file(url, temp_vtt):
                         if self._convert_vtt_to_srt(temp_vtt, filepath_srt):
@@ -83,8 +95,8 @@ class SubtitleManager:
                     logging.warning(f"[SUBS] Skipping empty/missing subtitle: {filepath_srt}")
                     continue
 
-                # Valmistellaan mux-argumentit
-                # Ohjelmatekstitys (qag) merkataan fi-koodilla, jotta soittimet tunnistavat sen
+                # Prepare mux arguments
+                # Program subtitles (qag) are marked with 'fi' code so players recognize them
                 lang_code = "fi" if ("fi" in lang or "qag" in lang) else lang_clean[:3]
                 rel_path = os.path.relpath(filepath_srt)
                 
@@ -106,7 +118,7 @@ class SubtitleManager:
         except: return False
 
     def _download_with_tool(self, url, output_path):
-        """Käyttää m3u8dl-re:tä lataamaan ja muuntamaan SRT:ksi"""
+        """Uses m3u8dl-re to download and convert to SRT"""
         import time
         ts = int(time.time()*1000)
         temp_name = f"sub_dl_tmp_{ts}"
@@ -119,7 +131,7 @@ class SubtitleManager:
         ]
         try:
             subprocess.run(cmd, check=False)
-            # Etsitään lopputulos (lataaja voi lisätä kielikoodeja nimeen)
+            # Search for the result (downloader might add language codes to the name)
             # N_m3u8DL-RE might name it temp_name.en.srt or just temp_name.srt
             found_file = None
             for f in os.listdir(self.output_dir):
@@ -185,6 +197,61 @@ class SubtitleManager:
                 f.write("\n".join(srt_lines))
             return True
         except: return False
+
+    def _convert_sami_to_srt(self, sami_path, srt_path):
+        """Simple SAMI to SRT converter for Viaplay"""
+        try:
+            with open(sami_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            
+            # Unescape common entities
+            import html
+            content = html.unescape(content)
+            
+            # Extract Synchronization Points (Cues)
+            # <SYNC Start=1234><P Class=SVCC>Hello
+            pattern = re.compile(r'<SYNC Start=(\d+)>\s*(?:<P[^>]*>)?(.*?)(?=<SYNC|</body>|</SAMI>)', re.DOTALL | re.IGNORECASE)
+            matches = pattern.findall(content)
+            
+            if not matches: return False
+            
+            srt_lines = []
+            for i in range(len(matches)):
+                start_ms = int(matches[i][0])
+                text = matches[i][1].strip()
+                
+                # Skip empty text
+                if not text or text.lower() == '&nbsp;': continue
+                
+                # End time is the start of next cue, or start + 5s
+                end_ms = int(matches[i+1][0]) if i + 1 < len(matches) else start_ms + 5000
+                
+                # Clean HTML tags from text
+                text = re.sub(r'<[^>]+>', '', text)
+                text = text.replace('\r', '').replace('\n', ' ').strip()
+                
+                if not text: continue
+                
+                def format_time(ms):
+                    h = ms // 3600000
+                    m = (ms % 3600000) // 60000
+                    s = (ms % 60000) // 1000
+                    mm = ms % 1000
+                    return f"{h:02d}:{m:02d}:{s:02d},{mm:03d}"
+                
+                srt_lines.append(f"{len(srt_lines) // 4 + 1}")
+                srt_lines.append(f"{format_time(start_ms)} --> {format_time(end_ms)}")
+                srt_lines.append(text)
+                srt_lines.append("")
+                
+            if not srt_lines: return False
+            
+            with open(srt_path, 'w', encoding='utf-8') as f:
+                f.write("\n".join(srt_lines))
+            return True
+        except Exception as e:
+            logging.warning(f"[SUBS] SAMI conversion failed: {e}")
+            return False
 
     def _download_file(self, url, filepath):
         try:
