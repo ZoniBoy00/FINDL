@@ -37,22 +37,71 @@ class Downloader:
             if not os.path.exists(d):
                 os.makedirs(d)
 
-    def download(self, manifest_url, keys, title="video", subtitles=None, origin="https://www.mtv.fi", skip_subs=False, use_ytdlp=False, original_url=None):
-        """
-        Main entry point for downloading. Routes to the appropriate strategy.
-        """
+    def download(self, url, keys=None, title="video", subtitles=None, origin="https://www.mtv.fi", skip_subs=False, use_ytdlp=False, original_url=None, cookies=None, token=None, license_headers=None):
+        # Yle Areena works better with N_m3u8DL-RE for stability if unencrypted/AES-128
+        # but yt-dlp is kept for specific cases or explicit requests.
         if use_ytdlp:
-            # yt-dlp works best with the original page URL for Yle
-            download_url = original_url if original_url else manifest_url
-            return self.download_ytdlp(download_url, title, origin, skip_subs)
+            # When using yt-dlp with force_generic, we MUST use the manifest URL
+            return self.download_ytdlp(url, title, origin, skip_subs, cookies, license_headers, original_url)
         
-        return self.download_re(manifest_url, keys, title, subtitles, origin, skip_subs)
+        # Override origin for Yle if needed
+        actual_origin = origin
+        if "yle.fi" in (original_url or url).lower():
+            actual_origin = "https://areena.yle.fi"
+            
+        return self.download_re(url, keys, title, subtitles, actual_origin, skip_subs, cookies, token, license_headers, original_url=original_url)
 
-    def download_re(self, manifest_url, keys, title, subtitles, origin, skip_subs):
+    def _write_temp_cookies(self, cookies, domain=".mtv.fi"):
+        """Write cookies to a temporary Netscape formatted file for yt-dlp."""
+        if not cookies: return None
+        cookie_path = os.path.join(TEMP_DIR, f"cookies_{int(time.time())}.txt")
+        with open(cookie_path, "w", encoding="utf-8") as f:
+            f.write("# Netscape HTTP Cookie File\n")
+            for name, value in cookies.items():
+                f.write(f"{domain}\tTRUE\t/\tFALSE\t0\t{name}\t{value}\n")
+        return cookie_path
+
+    def download_re(self, manifest_url, keys, title, subtitles, origin, skip_subs, cookies=None, token=None, license_headers=None, original_url=None):
         """Standard download strategy using N_m3u8DL-RE."""
+        clean_title = self._sanitize_title(title)
         ts = int(time.time())
         temp_title = f"fndl_{ts}"
         
+        # Determine service-specific origin & referer
+        is_ruutu = "ruutu.fi" in manifest_url.lower() or "nelonenmedia" in manifest_url.lower()
+        effective_origin = "https://www.ruutu.fi" if is_ruutu else origin
+        effective_referer = (original_url if original_url else f"{effective_origin}/")
+
+        # Build headers for the download command
+        if is_ruutu:
+            # High-stealth browser imitation for Ruutu (Nelonen)
+            ruutu_headers = [
+                f"User-Agent: {CHROME_UA}",
+                "Origin: https://www.ruutu.fi",
+                f"Referer: {original_url if original_url else 'https://www.ruutu.fi/'}",
+                "Accept: */*",
+                "Accept-Language: fi-FI,fi;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Connection: keep-alive"
+            ]
+            if cookies:
+                cookie_str = "; ".join([f"{k}={v}" for k, v in cookies.items()])
+                ruutu_headers.append(f"Cookie: {cookie_str}")
+            
+            if token:
+                ruutu_headers.append(f"X-AxDRM-Message: {token}")
+        else:
+            # Katsomo/Other RE based headers often need the pipe format for .NET stability
+            header_str = f"User-Agent: {CHROME_UA}"
+            if effective_origin: header_str += f"|Origin: {effective_origin}"
+            if effective_referer: header_str += f"|Referer: {effective_referer}"
+            if cookies:
+                c_clean = "; ".join([f"{k}={v}" for k, v in cookies.items()]).replace("{", "%7B").replace("}", "%7D")
+                header_str += f"|Cookie: {c_clean}"
+            if token:
+                t_clean = str(token).replace("{", "%7B").replace("}", "%7D")
+                header_str += f"|Authorization: Bearer {t_clean}"
+
+        # Final command construction
         rel_output = os.path.relpath(self.output_dir)
         download_tmp = os.path.join(TEMP_DIR, f"t_{ts}")
         if not os.path.exists(download_tmp): os.makedirs(download_tmp)
@@ -60,9 +109,9 @@ class Downloader:
         cmd = [
             self.exe, manifest_url,
             "-mt",
-            "-H", f"User-Agent: {CHROME_UA}",
-            "-H", f"Origin: {origin}",
-            "-H", f"Referer: {origin}/",
+            "--thread-count", "8", # Reduced for stealth (avoid 401 rate limits)
+            "--concurrent-download", "True",
+            "--download-retry-count", "30",
             "--decryption-engine", "SHAKA_PACKAGER",
             "--decryption-binary-path", self.packager,
             "--select-video", "best",
@@ -71,17 +120,23 @@ class Downloader:
             "--save-name", temp_title,
             "--save-dir", rel_output,
             "--tmp-dir", download_tmp,
-            "--del-after-done", 
-            "--auto-subtitle-fix", "True", 
-            "--log-level", "INFO"
+            "--del-after-done",
+            "--auto-subtitle-fix", "True",
+            "--no-log",
+            "--check-segments-count", "False"
         ]
+
+        if is_ruutu:
+            for h in ruutu_headers:
+                cmd.extend(["-H", h])
+        else:
+            cmd.extend(["--header", header_str])
 
         # Handle Subtitles
         if skip_subs:
             cmd.extend(["--drop-subtitle", ".*"])
         else:
-            cmd.extend(["--select-subtitle", "lang=fi|suomi|und"])
-            cmd.extend(["--sub-format", "SRT"])
+            cmd.extend(["--select-subtitle", "lang=fi|suo|swe|en.*", "--sub-format", "SRT"])
             
             # Manual processing for special tracks (qag/CC)
             manager_subs = [s for s in (subtitles or []) if self._is_special_track(s)]
@@ -90,20 +145,18 @@ class Downloader:
                     sm = SubtitleManager(output_dir=self.output_dir)
                     sub_args, _ = sm.process_subtitles(manager_subs, ts)
                     if sub_args: cmd.extend(sub_args)
-                except Exception as e:
-                    logging.warning(f"[DOWNLOADER] Manual subtitle download failed: {e}")
+                except: pass
 
         # Add Decryption Keys
         if keys:
             for k in keys: cmd.extend(["--key", k])
 
+        # Final execution
         logging.info(f"[DOWNLOADER] Running N_m3u8DL-RE engine...")
         try:
             subprocess.run(cmd, check=False)
             
-            clean_title = self._sanitize_title(title)
             final_path = os.path.join(self.output_dir, f"{clean_title}.mkv")
-            
             temp_file = os.path.join(self.output_dir, f"{temp_title}.mkv")
             if not os.path.exists(temp_file):
                 temp_file = os.path.join(self.output_dir, f"{temp_title}.MUX.mkv")
@@ -112,7 +165,7 @@ class Downloader:
                 if os.path.exists(final_path): os.remove(final_path)
                 shutil.move(temp_file, final_path)
                 logging.info(f"[DOWNLOADER] Saved to: {final_path}")
-                self._extract_subs_from_folder(temp_title, clean_title)
+                # Optional: extra cleanup or post-processing could go here
                 return True
             return False
         except Exception as e:
@@ -121,7 +174,7 @@ class Downloader:
         finally:
             shutil.rmtree(download_tmp, ignore_errors=True)
 
-    def download_ytdlp(self, url, title, origin, skip_subs=False):
+    def download_ytdlp(self, url, title, origin, skip_subs=False, cookies=None, license_headers=None, original_url=None):
         """
         Specialized strategy using yt-dlp with "Temp-and-Move" to avoid WinError 32.
         Processes in an isolated temp dir, then moves to downloads.
@@ -173,22 +226,44 @@ class Downloader:
                 elif d['status'] == 'finished':
                     progress.update(pp_task, completed=1, total=1, description="[bold green]Finished")
 
+            # Mix headers and cookies into ydl_opts
+            ydl_headers = {
+                'User-Agent': CHROME_UA,
+                'Referer': original_url or "https://areena.yle.fi/",
+                'Origin': 'https://areena.yle.fi'
+            }
+            if license_headers:
+                for k, v in license_headers.items():
+                    if k.lower() not in ['user-agent', 'referer', 'origin']:
+                        ydl_headers[k] = v
+
             ydl_opts = {
-                'outtmpl': work_tmpl,
                 'format': 'bestvideo+bestaudio/best',
-                'merge_output_format': 'mkv',
+                'outtmpl': work_tmpl,
                 'quiet': True,
-                'noprogress': True,
                 'no_warnings': True,
+                'ignoreerrors': True,
+                'nocheckcertificate': True,
+                'merge_output_format': 'mkv',
+                'noplaylist': True,
+                'force_generic_extractor': True, # Bypass broken/blocked Ruutu-specific extractor
+                'extractor_args': {'generic': {'impersonate': 'chrome'}},
+                'socket_timeout': 30,
+                'retries': 10,
+                'http_headers': ydl_headers,
+                'noprogress': True,
                 'overwrites': True,
                 'nopart': True,              
                 'updatetime': False,         
                 'windowsfilenames': True,    
-                'writesubtitles': True,      
-                'writeautomaticsub': True,   
-                'subtitleslangs': ['all'],   
+                'writesubtitles': not skip_subs,      
+                'writeautomaticsub': not skip_subs,   
+                'subtitleslangs': ['fi.*', 'suo.*', 'en.*', 'und.*'],   
                 'subtitlesformat': 'srt/vtt/best',
-                'concurrent_fragment_downloads': 5,
+                'concurrent_fragment_downloads': 8, # Reduced for stability on Akamai
+                'fragment_retries': 15,
+                'skip_unavailable_fragments': True,
+                'socket_timeout': 60,
                 'add_metadata': True,
                 'progress_hooks': [ytdlp_progress_hook],
                 'postprocessor_hooks': [ytdlp_post_hook],
@@ -197,6 +272,12 @@ class Downloader:
                     {'key': 'FFmpegEmbedSubtitle'}
                 ]
             }
+            
+            # Pass cookies if available
+            if cookies:
+                # Determine domain: if URL has 'yle', use .yle.fi
+                target_domain = ".yle.fi" if "yle.fi" in (original_url or url).lower() else ".mtv.fi"
+                ydl_opts['cookiefile'] = self._write_temp_cookies(cookies, domain=target_domain)
 
             try:
                 progress.console.log(f"[bold cyan]INFO[/bold cyan]     [DOWNLOADER] Engaging yt-dlp engine...")

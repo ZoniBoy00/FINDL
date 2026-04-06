@@ -250,9 +250,11 @@ class RuutuExtractor(BaseExtractor):
                 # 1. Manifest Detection (Ignoring Ads)
                 is_manifest = (".m3u8" in u or ".mpd" in u) and ".webmanifest" not in u
                 if is_manifest and not any(k in u for k in ["vmap", "vast", "doubleclick", "/ads/", "ad-delivery"]):
-                    if not result["manifest_url"] or "gatekeeper" in u:
+                    # Prioritize manifest if it's the gatekeeper or Nelonen media master
+                    is_prio = "gatekeeper" in u or "master" in u
+                    if not result["manifest_url"] or is_prio:
                         result["manifest_url"] = response.url
-                        logging.info(f"[RUUTU] Manifest detected: {u[:50]}...")
+                        logging.info(f"[RUUTU] Master detected: {u[:50]}...")
 
                 # 2. PSSH Sniffing from Init Segments
                 if "init.mp4" in u or "init-v1" in u:

@@ -194,10 +194,18 @@ class YleExtractor(BaseExtractor):
             logging.error(f"[YLE] Invalid URL: {url}")
             return None
 
+        # Mimic a real browser to prevent "Connection aborted" or "Remote disconnected"
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
             'user_agent': CHROME_UA,
+            'http_headers': {
+                'User-Agent': CHROME_UA,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Accept-Language': 'fi-FI,fi;q=0.9,en-US;q=0.8,en;q=0.7',
+                'Referer': 'https://areena.yle.fi/',
+                'Origin': 'https://areena.yle.fi',
+            }
         }
 
         try:
@@ -205,7 +213,7 @@ class YleExtractor(BaseExtractor):
                 info = ydl.extract_info(url, download=False)
             
             if not info:
-                return None
+                return {"error": "yt-dlp returned no metadata"}
 
             # Handle entries (take first item if still passed to extract)
             if 'entries' in info:
@@ -218,7 +226,7 @@ class YleExtractor(BaseExtractor):
                 "title": info.get('title'),
                 "manifest_url": info.get('url'),
                 "subtitles": [],
-                "cookies": {},
+                "cookies": info.get('cookies') or {},
                 "license_url": None,
                 "license_headers": {},
                 "psshs": [],

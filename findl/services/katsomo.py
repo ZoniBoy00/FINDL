@@ -49,6 +49,14 @@ class KatsomoExtractor(BaseExtractor):
                         page.wait_for_timeout(1000)
                         continue
                     break
+                
+                # ALSO: Try to click Play/Watch button to trigger license request
+                for _ in range(2):
+                    for sel in ["button:has-text('Katso')", "button:has-text('Toista')", ".play-icon", "button[aria-label='Play']"]:
+                        if page.locator(sel).count() > 0:
+                            page.locator(sel).first.click()
+                            page.wait_for_timeout(2000)
+                            break
             except: pass
 
             # Extra wait for safety
@@ -82,7 +90,22 @@ class KatsomoExtractor(BaseExtractor):
                             
                             if title:
                                 title = title.split("\n")[0].strip()
+                                # Clean up generic tokens
+                                title = re.sub(r'^(Katso|Plus|Uusi|Suosittelemme)\s+', '', title, flags=re.I)
+                                title = re.sub(r'\s+(Plus|HD)$', '', title, flags=re.I)
                             
+                            if not title or len(title) < 2 or title.lower() in ["plus", "katso"]:
+                                # Try to find season/episode info in the parent
+                                title = page.evaluate("""(id) => {
+                                    const el = document.querySelector(`a[href*="${id}"]`);
+                                    const card = el?.closest('[class*="card"], [class*="item"], div');
+                                    if (!card) return "";
+                                    const text = card.innerText.split('\\n').map(t => t.trim()).filter(t => t.length > 2);
+                                    // Look for "Jakso X" or something descriptive
+                                    const best = text.find(t => /Jakso \\d+/i.test(t)) || text[0];
+                                    return best || "";
+                                }""", video_id)
+                                
                             if not title or len(title) < 2:
                                 title = f"Episode {video_id[:8]}"
 
@@ -274,7 +297,7 @@ class KatsomoExtractor(BaseExtractor):
                     except: pass
 
                 # Capture License Request (Widevine)
-                is_lic = any(kw in response.url for kw in ["lic.drmtoday.com", "lic.widevine.com", "license"])
+                is_lic = any(kw in response.url for kw in ["drmtoday.com", "widevine.com", "license", "lic"])
                 if is_lic and response.request.method == "POST":
                     result["license_url"] = response.url
                     
@@ -324,9 +347,33 @@ class KatsomoExtractor(BaseExtractor):
 
             # Extract Metadata
             try:
+                # Find series/season from breadcrumbs or metadata
+                result["series"] = page.evaluate("""() => {
+                    // Try Breadcrumbs
+                    const bread = Array.from(document.querySelectorAll('a[href*="/sarja/"], a[href*="/ohjelma/"]'))
+                        .map(a => a.innerText.trim())
+                        .filter(t => t.length > 2);
+                    if (bread.length > 0) return bread[0];
+                    
+                    // Try page title prefix
+                    const title = document.title.split('|')[0].trim();
+                    if (title.includes(':')) return title.split(':')[0].trim();
+                    
+                    return "Katsomo_Sarja";
+                }""")
+                
+                result["season"] = page.evaluate("""() => {
+                    const text = document.body.innerText;
+                    const match = text.match(/Kausi\s+(\d+)/i) || text.match(/Season\s+(\d+)/i);
+                    return match ? match[0] : "Kausi 1";
+                }""")
+                
                 og_title = page.locator('meta[property="og:title"]').get_attribute('content')
-                result["title"] = (og_title or page.title()).split("|")[0].strip()
-                result["title"] = re.sub(r'[^\w\s-]', '', result["title"]).strip().replace(" ", "_")
+                # For single episodes, the title is usually "Jakso X - Title"
+                raw_title = (og_title or page.title()).split("|")[0].strip()
+                if ":" in raw_title: raw_title = raw_title.split(":", 1)[-1].strip()
+                
+                result["title"] = re.sub(r'[^\w\s-]', '', raw_title).strip().replace(" ", "_")
             except: pass
 
             # Final wait loop
@@ -391,7 +438,11 @@ class KatsomoExtractor(BaseExtractor):
             result["cookies"] = {c['name']: c['value'] for c in context.cookies()}
             result["pssh"] = result["psshs"][0] if result["psshs"] else None
             
-            context.close()
+            # Clean up safely
+            try:
+                context.close()
+            except: pass
+            
             return result
 
     def get_subtitles_from_manifest_url(self, manifest_url):

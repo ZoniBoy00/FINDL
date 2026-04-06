@@ -1,10 +1,20 @@
 import os
 import click
 import logging
+import re
 import time
 from rich.logging import RichHandler
 from rich.table import Table
 from rich.box import ROUNDED
+
+def sanitize_path_name(name):
+    """Removes or replaces characters that are illegal in Windows folder names."""
+    if not name: return "Unknown"
+    # Illegal characters: < > : " / \ | ? *
+    # Also remove control characters and trailing dots/spaces
+    s = re.sub(r'[\<\>\:\"\/\\\|\?\*]', '-', str(name))
+    s = re.sub(r'[\x00-\x1f]', '', s)
+    return s.strip().strip('.')
 
 # Local Imports
 from findl import KatsomoExtractor, RuutuExtractor, YleExtractor, ViaplayExtractor, DRMHandler, Downloader
@@ -43,6 +53,7 @@ def main(url, output, title, pssh, no_subs):
         extractor = YleExtractor()
     elif "viaplay." in url:
         extractor = ViaplayExtractor()
+        UI.print_step("Viaplay support is currently WORK IN PROGRESS and may not work.", "warning")
     else:
         UI.error("Unsupported service. Supported: Katsomo, Ruutu, Yle Areena, Viaplay.")
         return
@@ -83,10 +94,8 @@ def main(url, output, title, pssh, no_subs):
             
             console.print(table)
             
-            selection = click.prompt(
-                "\nValitse ladattavat jaksot (esim. 'all', '5' ensimmäiset 5, '1-3' väli, tai '1,3,5')", 
-                default="all"
-            )
+            console.print("\n[bold yellow]Valitse ladattavat jaksot (esim. 'all', '1-3', '1,3,5')[/bold yellow]")
+            selection = input("Valinta [kaikki]: ").strip() or "all"
             
             to_download = []
             selection = selection.lower().strip()
@@ -94,12 +103,10 @@ def main(url, output, title, pssh, no_subs):
             if selection == 'all':
                 to_download = episodes
             elif selection.isdigit():
-                # If it's just one number, treat it as "first N episodes"
                 count = int(selection)
                 to_download = episodes[:count]
             else:
                 try:
-                    # Handle 1,2,5 and 1-10 formats
                     parts = selection.split(',')
                     for p in parts:
                         p = p.strip()
@@ -124,8 +131,8 @@ def main(url, output, title, pssh, no_subs):
                 UI.print_step(f"Seuraavaksi: [bold]{ep.get('season', '?')}[/bold] - [bold white]{ep['title']}[/bold white]", "running")
                 
                 # Create subfolder path: "Series Name/Season X"
-                series_name = ep.get("series", "Unknown Series").replace(":", "-").replace("/", "-").strip()
-                season_name = ep.get("season", "Kausi 1").replace(":", "-").replace("/", "-").strip()
+                series_name = sanitize_path_name(ep.get("series", "Unknown Series"))
+                season_name = sanitize_path_name(ep.get("season", "Kausi 1"))
                 subfolder = os.path.join(series_name, season_name)
 
                 # Calculate episode number within its season for numbering
@@ -137,12 +144,10 @@ def main(url, output, title, pssh, no_subs):
                     
                 numbered_title = f"{episode_num:02d} - {ep['title']}"
                 
-                # Recursively call main_logic but for a single URL with subfolder and numbered title
                 process_single_url(ep['url'], extractor, output, numbered_title, pssh, no_subs, subfolder=subfolder)
             
-            return # Exit playlist flow
+            return
 
-    # Standard Single Video Flow (handles non-series or series discovery that turned up empty)
     process_single_url(url, extractor, output, title, pssh, no_subs)
 
 def process_single_url(url, extractor, output, title, pssh, no_subs, subfolder=None):
@@ -151,11 +156,31 @@ def process_single_url(url, extractor, output, title, pssh, no_subs, subfolder=N
     
     if not info or not info.get("manifest_url"):
         UI.error(f"Extraction failed for {url}")
+        if info and "error" in info: UI.error(info["error"]) # Show specific error if available
         return
 
     if pssh:
         info["pssh"] = pssh
         info["psshs"] = [pssh]
+
+    # Handle subfolder organization
+    base_output = output or "downloads"
+    effective_subfolder = subfolder
+    
+    # Auto-detect subfolder from info if not provided explicitly (for single URL inputs)
+    if not effective_subfolder and info.get("series"):
+        series = sanitize_path_name(info["series"])
+        season = sanitize_path_name(info.get("season", "Kausi 1"))
+        effective_subfolder = os.path.join(series, season)
+    
+    if effective_subfolder:
+        # Sanitize each part of the subfolder path
+        parts = [sanitize_path_name(p) for p in effective_subfolder.split(os.sep)]
+        effective_subfolder = os.path.join(*parts)
+        effective_output = os.path.join(base_output, effective_subfolder)
+        os.makedirs(effective_output, exist_ok=True)
+    else:
+        effective_output = base_output
 
     # Handle --no-subs
     subtitles = [] if no_subs else info.get("subtitles", [])
@@ -213,22 +238,17 @@ def process_single_url(url, extractor, output, title, pssh, no_subs, subfolder=N
     if not final_title:
         final_title = info.get("title") or url.split('/')[-1].split('?')[0].replace('-', '_') or f"Video_{int(time.time())}"
 
-    # Handle subfolder organization
-    base_output = output or "."
-    if subfolder:
-        effective_output = os.path.join(base_output, subfolder)
-        if not os.path.exists(effective_output):
-            os.makedirs(effective_output, exist_ok=True)
-    else:
-        effective_output = base_output
-
     UI.download_session(final_title, effective_output, keys, subtitles)
     
     downloader = Downloader(output_dir=effective_output)
     start_time = time.time()
     
     UI.print_step(f"Starting downloader for {final_title}", "running")
-    use_ytdlp = "areena.yle.fi" in url
+    # Select best engine for the service/encryption
+    is_yle = "areena.yle.fi" in url.lower()
+    use_ytdlp = is_yle # Keep Areena on yt-dlp as it's working
+
+    logging.info(f"[MAIN] Strategy select: {'yt-dlp' if use_ytdlp else 'N_m3u8DL-RE'}")
     
     success = downloader.download(
         info["manifest_url"], 
@@ -238,7 +258,10 @@ def process_single_url(url, extractor, output, title, pssh, no_subs, subfolder=N
         origin=info.get("origin", "https://www.mtv.fi"),
         skip_subs=no_subs,
         use_ytdlp=use_ytdlp,
-        original_url=url
+        original_url=url,
+        cookies=info.get("cookies"),
+        token=info.get("drm_token"),
+        license_headers=info.get("license_headers")
     )
     
     if success:

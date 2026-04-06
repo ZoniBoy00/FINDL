@@ -68,16 +68,71 @@ class BaseExtractor(ABC):
             match = re.search(r'#EXT-X-(?:SESSION-)?KEY:.*URI="data:[^;"]*?(?:;base64)?,([^"]+)"', content, re.I)
             if match:
                 pssh = match.group(1).split(',')[0].strip()
-                logging.debug(f"[BASE] Found PSSH via HLS Key: {pssh[:40]}...")
+                logging.debug(f"[BASE] Found PSSH via HLS Key (data-URI): {pssh[:40]}...")
                 return pssh
 
-            # Ruutu DASH PSSH (Axinom format / plain XML)
-            if "<cenc:pssh>" in content:
-                try:
-                    pssh = content.split("<cenc:pssh>")[1].split("</cenc:pssh>")[0].strip()
-                    logging.debug(f"[BASE] Found PSSH in DASH manifest (XML extract)")
+            # Look for PSSH data in a direct pssh= attribute (common in A2D)
+            match = re.search(r'pssh="?([^,\s"]+)"?', content, re.I)
+            if match:
+                pssh = match.group(1).strip()
+                if len(pssh) > 40:
+                    logging.debug(f"[BASE] Found PSSH via pssh= attribute: {pssh[:40]}...")
                     return pssh
-                except: pass
+            
+            # Fallback for DASH/XML PSSH Patterns
+            patterns = [
+                r'<(?:[a-zA-Z0-9]+:)?pssh[^>]*>(.*?)</(?:[a-zA-Z0-9]+:)?pssh>', 
+                r'cenc:pssh>(.*?)</cenc:pssh>',
+            ]
+            for p in patterns:
+                match = re.search(p, content, re.I | re.S)
+                if match:
+                    pssh = match.group(1).strip()
+                    logging.debug(f"[BASE] Found PSSH via DASH Pattern: {pssh[:40]}...")
+                    return pssh
+
+            # Final Fallback: Search for any long base64 string that looks like a PSSH box
+            # cHNzaA is 'pssh' in base64 within a BMFF box
+            common_pssh_matches = re.findall(r'([a-zA-Z0-9+/=]{60,})', content)
+            for candidate in common_pssh_matches:
+                if "cHNzaA" in candidate:
+                    logging.debug(f"[BASE] Found PSSH via raw base64 scan: {candidate[:40]}...")
+                    return candidate
+
+            # --- 2. SECONDARY: Recurse into HLS sub-playlists if it's a master ---
+            if "#EXT-X-STREAM-INF" in content:
+                # Find first variant/media playlist
+                sub_match = re.search(r'#EXT-X-STREAM-INF:.*?\n(.*?\.m3u8.*)', content, re.I)
+                if sub_match:
+                    sub_url = sub_match.group(1).strip()
+                    if not sub_url.startswith("http"):
+                        # Resolve relative path
+                        base = url.rsplit("/", 1)[0]
+                        if sub_url.startswith("/"):
+                            sub_url = "/".join(url.split("/")[:3]) + sub_url
+                        else:
+                            sub_url = f"{base}/{sub_url}"
+                    
+                    logging.debug(f"[BASE] No PSSH in Master, checking Media Playlist: {sub_url}")
+                    # Simple one-level recursion
+                    try:
+                        sub_resp = requests.get(sub_url, headers=req_headers, cookies=cookies, timeout=10)
+                        if sub_resp.status_code == 200:
+                            sub_content = sub_resp.text
+                            # Apply the SAME logic to sub_content
+                            # HLS/pssh search
+                            m = re.search(r'pssh="?([^,\s"]+)"?', sub_content, re.I)
+                            if m: return m.group(1).strip()
+                            
+                            # data-URI search
+                            m = re.search(r'#EXT-X-(?:SESSION-)?KEY:.*URI="data:[^;"]*?(?:;base64)?,([^"]+)"', sub_content, re.I)
+                            if m: return m.group(1).split(',')[0].strip()
+                            
+                            # base64 scan
+                            matches = re.findall(r'([a-zA-Z0-9+/=]{60,})', sub_content)
+                            for cand in matches:
+                                if "cHNzaA" in cand: return cand
+                    except: pass
 
             # B. XML / JSON PSSH patterns (DASH/MPD)
             patterns = [
@@ -91,25 +146,6 @@ class BaseExtractor(ABC):
                     pssh = match.group(1).strip()
                     logging.debug(f"[BASE] Found PSSH via DASH Pattern: {pssh[:40]}...")
                     return pssh
-
-            # HLS Master Playlist -> Recurse into children
-            if "#EXT-X-STREAM-INF" in content:
-                lines = content.splitlines()
-                urls = []
-                for i, line in enumerate(lines):
-                    if "#EXT-X-STREAM-INF" in line:
-                        # Find the next non-empty line that isn't a comment
-                        j = i + 1
-                        while j < len(lines) and (not lines[j].strip() or lines[j].startswith("#")):
-                            j += 1
-                        if j < len(lines):
-                            urls.append(urljoin(url, lines[j].strip()))
-                
-                # Check up to 10 child playlists (more aggressive)
-                for child_url in urls[:10]:
-                    logging.debug(f"[BASE] Scanning child playlist: {child_url}")
-                    found = self.get_pssh_from_manifest(child_url, cookies, headers)
-                    if found: return found
 
             # Init Segment scan (MP4 header)
             init_match = re.search(r'#EXT-X-MAP:URI="(.*?)"', content, re.I)
