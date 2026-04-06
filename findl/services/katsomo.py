@@ -7,7 +7,7 @@ import requests
 from playwright.sync_api import sync_playwright
 from pywidevine.license_protocol_pb2 import SignedMessage, LicenseRequest
 from .base import BaseExtractor
-from ..config import CHROME_UA, SESSION_DIR
+from ..config import CHROME_UA, SESSION_DIR, TEMP_DIR
 from ..ui.display import UI
 
 class KatsomoExtractor(BaseExtractor):
@@ -192,8 +192,6 @@ class KatsomoExtractor(BaseExtractor):
             dict: Dictionary containing manifest_url, keys (via DRM handler), subtitles, etc.
         """
         with sync_playwright() as p:
-            if not os.path.exists(SESSION_DIR): os.makedirs(SESSION_DIR)
-            
             context = p.chromium.launch_persistent_context(
                 SESSION_DIR,
                 headless=False,
@@ -207,6 +205,13 @@ class KatsomoExtractor(BaseExtractor):
                 ]
             )
             page = context.pages[0] if context.pages else context.new_page()
+
+            # Anti-detection script
+            page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                window.chrome = { runtime: {} };
+                Object.defineProperty(navigator, 'languages', {get: () => ['fi-FI', 'fi']});
+            """)
 
             # Anti-detection script
             page.add_init_script("""
@@ -233,23 +238,46 @@ class KatsomoExtractor(BaseExtractor):
                 if "a2d.tv" in response.url and "playback" in response.url:
                     try:
                         data = response.json()
-                        json_str = response.text()
-                        
                         # Deep PSSH search in JSON response
                         def find_pssh_recursive(obj):
                             if isinstance(obj, dict):
                                 for k, v in obj.items():
-                                    if k.lower() in ["pssh", "psshvalue", "widevinepssh"] and isinstance(v, str) and len(v) > 40:
+                                    if k.lower() in ["pssh", "psshvalue", "widevinepssh"] and isinstance(v, str) and len(v) > 20:
                                         if v not in result["psshs"]:
                                             result["psshs"].append(v)
-                                            logging.info(f"[KATSOMO] PSSH found in field: {k}")
+                                            logging.info(f"[KATSOMO] PSSH found in JSON field: {k}")
                                     else:
                                         find_pssh_recursive(v)
                             elif isinstance(obj, list):
                                 for item in obj:
                                     find_pssh_recursive(item)
-                        
                         find_pssh_recursive(data)
+                    except: pass
+                
+                # Capture Manifest Content for PSSH (Sniffing improvement)
+                if (".m3u8" in response.url or ".mpd" in response.url) and response.status == 200:
+                    try:
+                        content = response.text()
+                        pssh_match = re.search(r'#EXT-X-(?:SESSION-)?KEY:.*URI="data:[^;"]*?(?:;base64)?,([^"]+)"', content, re.I)
+                        if pssh_match:
+                            p = pssh_match.group(1).split(',')[0].strip()
+                            if p not in result["psshs"]:
+                                result["psshs"].append(p)
+                                logging.info(f"[KATSOMO] PSSH sniffed from manifest (HLS Key)")
+                        
+                        pssh_match = re.search(r'pssh="?([^,\s"]+)"?', content, re.I)
+                        if pssh_match:
+                            p = pssh_match.group(1).strip()
+                            if len(p) > 20 and p not in result["psshs"]:
+                                result["psshs"].append(p)
+                                logging.info(f"[KATSOMO] PSSH sniffed from manifest (pssh=)")
+                    except: pass
+
+                # Capture Playback JSON Data (Legacy fallback)
+                if "a2d.tv" in response.url and "playback" in response.url:
+                    try:
+                        json_str = response.text()
+                        data = response.json()
                         
                         # Fallback: Look for base64 pssh-box anywhere
                         if not result["psshs"]:
@@ -296,8 +324,8 @@ class KatsomoExtractor(BaseExtractor):
                                 })
                     except: pass
 
-                # Capture License Request (Widevine)
-                is_lic = any(kw in response.url for kw in ["drmtoday.com", "widevine.com", "license", "lic"])
+                # Capture License Request (Widevine / PlayReady)
+                is_lic = any(kw in response.url.lower() for kw in ["drmtoday", "widevine", "license", "lic-wv", "lic-pr"])
                 if is_lic and response.request.method == "POST":
                     result["license_url"] = response.url
                     
@@ -362,7 +390,7 @@ class KatsomoExtractor(BaseExtractor):
                     return "Katsomo_Sarja";
                 }""")
                 
-                result["season"] = page.evaluate("""() => {
+                result["season"] = page.evaluate(r"""() => {
                     const text = document.body.innerText;
                     const match = text.match(/Kausi\s+(\d+)/i) || text.match(/Season\s+(\d+)/i);
                     return match ? match[0] : "Kausi 1";
@@ -382,7 +410,10 @@ class KatsomoExtractor(BaseExtractor):
             max_wait = 120 
             
             while (time.time() - start < max_wait):
-                # Wait for manifest, license, and PSSH
+                elapsed = int(time.time() - start)
+                if elapsed % 15 == 0 and elapsed > 0:
+                    UI.print_step(f"Still waiting... ({elapsed}s) Check if login is required on the page.", "running")
+                
                 if result["manifest_url"] and result["license_url"] and result["psshs"]:
                     page.wait_for_timeout(2000)
                     break

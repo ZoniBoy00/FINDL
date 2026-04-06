@@ -33,7 +33,8 @@ Built with **Python**, utilizing **Playwright** for intelligent extraction, **N_
 - **Windows Optimized**: Custom "Temp-and-Move" strategy to prevent file locking issues (`WinError 32`).
 - **Clean Lists**: Intelligently filters out recommendations and language selectors.
 
-#### Viaplay (Work-in-Progress / WIP)
+#### Viaplay (WIP - Work in Progress 🚧)
+- **Experimental Support**: Currently in early development.
 - **Metadata Extraction**: Extracts rich metadata including production year and synopsis.
 - **SAMI Subtitles**: Custom converter for Viaplay's SAMI subtitle format to standard SRT.
 - **Series Discovery**: Crawls seasons and episodes using Playwright.

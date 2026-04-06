@@ -8,7 +8,7 @@ from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright
 from pywidevine.license_protocol_pb2 import SignedMessage, LicenseRequest
 from .base import BaseExtractor
-from ..config import CHROME_UA, SESSION_DIR
+from ..config import CHROME_UA, SESSION_DIR, TEMP_DIR
 from ..ui.display import UI
 
 class RuutuExtractor(BaseExtractor):
@@ -197,8 +197,6 @@ class RuutuExtractor(BaseExtractor):
 
     def extract(self, url):
         with sync_playwright() as p:
-            if not os.path.exists(SESSION_DIR): os.makedirs(SESSION_DIR)
-            
             context = p.chromium.launch_persistent_context(
                 SESSION_DIR,
                 headless=False,
@@ -212,6 +210,13 @@ class RuutuExtractor(BaseExtractor):
                 ]
             )
             page = context.pages[0] if context.pages else context.new_page()
+
+            # Anti-detection script
+            page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                window.chrome = { runtime: {} };
+                Object.defineProperty(navigator, 'languages', {get: () => ['fi-FI', 'fi']});
+            """)
 
             # Anti-detection
             page.add_init_script("""
@@ -240,7 +245,7 @@ class RuutuExtractor(BaseExtractor):
                 "subtitles": [],
                 "cookies": {},
                 "origin": "https://www.ruutu.fi",
-                "drm_tokens": [], # For collecting multiple tokens (ads vs content)
+                "drm_tokens": [],
                 "drm_token": None
             }
 
@@ -250,11 +255,11 @@ class RuutuExtractor(BaseExtractor):
                 # 1. Manifest Detection (Ignoring Ads)
                 is_manifest = (".m3u8" in u or ".mpd" in u) and ".webmanifest" not in u
                 if is_manifest and not any(k in u for k in ["vmap", "vast", "doubleclick", "/ads/", "ad-delivery"]):
-                    # Prioritize manifest if it's the gatekeeper or Nelonen media master
-                    is_prio = "gatekeeper" in u or "master" in u
-                    if not result["manifest_url"] or is_prio:
+                    # Prioritize master manifest for best quality/bitrate
+                    is_master = "master" in u or "gatekeeper" in u
+                    if not result["manifest_url"] or is_master:
                         result["manifest_url"] = response.url
-                        logging.info(f"[RUUTU] Master detected: {u[:50]}...")
+                        logging.info(f"[RUUTU] Manifest detected{ ' (MASTER)' if is_master else ''}: {u[u.find('nelonenmedia'):u.find('nelonenmedia')+40]}...")
 
                 # 2. PSSH Sniffing from Init Segments
                 if "init.mp4" in u or "init-v1" in u:
@@ -267,44 +272,49 @@ class RuutuExtractor(BaseExtractor):
                             logging.info(f"[RUUTU] PSSH sniffed from init segment")
                     except Exception as e:
                         pass
-
                 # 3. DRM License & Tokens
-                if ("widevine" in u or "acquirelicense" in u) and response.request.method == "POST":
-                    # IMPORTANT: Don't overwrite content license URL with ad license URLs
-                    if not result["license_url"] or not any(k in u for k in ["vmap", "vast", "/ads/", "doubleclick"]):
-                        result["license_url"] = response.url # Keep full URL (needed for CMCD params)
+                is_lic = "gatetv" in u and "nelonenmedia" in u and response.request.method == "POST"
+                if is_lic:
+                    # Capture License URL & Headers
+                    result["license_url"] = response.url
+                    for k, v in response.request.headers.items():
+                        k_lower = k.lower()
+                        if k_lower in ['user-agent', 'origin', 'referer', 'authorization', 'content-type'] or k_lower.startswith('x-'):
+                            result["license_headers"][k] = v
                         
-                        # Capture HTTP Headers
-                        for k, v in response.request.headers.items():
-                            k_lower = k.lower()
-                            
-                            # General headers needed for license request
-                            if k_lower in ['user-agent', 'origin', 'referer', 'authorization', 'content-type'] or k_lower.startswith('x-'):
-                                result["license_headers"][k] = v
-                            
-                            # AXINOM TOKEN (Capture ALL candidates)
-                            if k_lower == 'x-axdrm-message':
-                                token = v
-                                # Only keep as latest if it doesn't look like an ad request (u is the request URL)
-                                if not any(k in u for k in ["vmap", "vast", "/ads/", "doubleclick"]):
-                                    result["drm_token"] = token 
-                                
-                                if token not in result["drm_tokens"]:
-                                    result["drm_tokens"].append(token)
-                                    logging.info("[RUUTU] Axinom Token captured from network")
-            
+                        # AXINOM TOKEN
+                        if k_lower == 'x-axdrm-message':
+                            result["drm_token"] = v
+                            if v not in result["drm_tokens"]:
+                                result["drm_tokens"].append(v)
+                
+                # 4. PSSH Sniffing from response body
+                if "pssh" in u or ("/init" in u and ".mp4" in u):
+                    try:
+                        body = response.body()
+                        if b"pssh" in body:
+                            idx = body.find(b"pssh")
+                            # Simple extraction: search for PSSH box
+                            size = int.from_bytes(body[idx-4:idx], "big")
+                            if 8 < size < 1024:
+                                pssh_data = body[idx-4:idx+size-4]
+                                p64 = base64.b64encode(pssh_data).decode()
+                                if p64 not in result["psshs"]:
+                                    result["psshs"].append(p64)
+                                    logging.info(f"[RUUTU] PSSH sniffed from network")
+                    except: pass
             page.on("response", handle_response)
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.goto(url, wait_until="networkidle", timeout=90000)
             
-            # Interactive Play
+            # Interactive Play (Consent and Play buttons)
             try:
-                for btn_text in ["Hyväksy", "Kyllä", "Accept", "Hyväksy kaikki", "Salli"]: # Consent and confirmation: "Hyväksy" (Accept), "Kyllä" (Yes), "Salli" (Allow)
+                for btn_text in ["Hyväksy", "Kyllä", "Accept", "Hyväksy kaikki", "Salli"]:
                     if page.get_by_role("button", name=btn_text, exact=False).count() > 0:
                         page.get_by_role("button", name=btn_text, exact=False).first.click()
                         page.wait_for_timeout(2000)
                         break
                 
-                for sel in [".play-button", "button.play", ".player-play-button", "[aria-label='Toista']", ".vjs-big-play-button"]: # "Toista" = Play
+                for sel in [".play-button", "button.play", ".player-play-button", "[aria-label='Toista']", ".vjs-big-play-button"]:
                     btn = page.locator(sel)
                     if btn.count() > 0:
                         btn.first.click()
@@ -312,25 +322,42 @@ class RuutuExtractor(BaseExtractor):
                         break
             except: pass
 
-            # Metadata
+            # Metadata extraction
             try:
                 og_title = page.locator('meta[property="og:title"]').get_attribute('content')
                 result["title"] = (og_title or page.title()).split("|")[0].strip()
                 result["title"] = re.sub(r'[^\w\s-]', '', result["title"]).strip().replace(" ", "_")
             except: pass
-
-            # Final Wait Loop (Extended for Ads)
+            
+            # Interactive Play & Wait for Cookies to Settle
             UI.print_step("Waiting for license data (skip ads)...", "running")
             start = time.time()
-            while time.time() - start < 60:
+            while time.time() - start < 90:
+                elapsed = int(time.time() - start)
+                if elapsed % 15 == 0 and elapsed > 0:
+                    UI.print_step(f"Still waiting... ({elapsed}s) Check if login/play is needed.", "running")
+                    
+                if result["manifest_url"] and (result["drm_token"] or result["license_url"]):
+                    # Wait a bit longer to ensure cookies are fully set
+                    page.wait_for_timeout(5000)
+                    UI.print_step("Manifest & License found, finalizing...", "running")
+                    break
+                
                 # Fast-forward ads
                 try:
                     page.evaluate("document.querySelectorAll('video').forEach(v => { v.muted = true; v.playbackRate = 16; });")
                 except: pass
 
+                # Priority logic: Try to find a master or gatekeeper first
+                if result["manifest_url"]:
+                    if "master" in result["manifest_url"] or "gatekeeper" in result["manifest_url"]:
+                         # We have a high-quality manifest, but keep waiting for PSSH
+                         pass
+                
                 if result["manifest_url"] and (result["psshs"] or result["license_url"]):
+                    # Wait a bit longer to ensure cookies are fully set
+                    page.wait_for_timeout(5000)
                     UI.print_step("Manifest & License found, finalizing...", "running")
-                    page.wait_for_timeout(3000)
                     break
                 page.wait_for_timeout(1000)
 
@@ -374,6 +401,11 @@ class RuutuExtractor(BaseExtractor):
             if result.get("drm_token") and result["drm_token"] not in result["drm_tokens"]:
                 result["drm_tokens"].append(result["drm_token"])
 
+            result["cookies"] = {c['name']: c['value'] for c in context.cookies()}
+            result["pssh"] = result["psshs"][0] if result["psshs"] else None
+            
+            # Capture final cookies for the downloader
+            # Final step: Always grab current cookies for manifest auth
             result["cookies"] = {c['name']: c['value'] for c in context.cookies()}
             result["pssh"] = result["psshs"][0] if result["psshs"] else None
             

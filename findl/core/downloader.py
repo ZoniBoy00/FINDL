@@ -78,10 +78,14 @@ class Downloader:
             ruutu_headers = [
                 f"User-Agent: {CHROME_UA}",
                 "Origin: https://www.ruutu.fi",
-                f"Referer: {original_url if original_url else 'https://www.ruutu.fi/'}",
+                "Referer: https://www.ruutu.fi/",
                 "Accept: */*",
                 "Accept-Language: fi-FI,fi;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Connection: keep-alive"
+                "Accept-Encoding: gzip, deflate, br",
+                "Connection: keep-alive",
+                "Sec-Fetch-Dest: empty",
+                "Sec-Fetch-Mode: cors",
+                "Sec-Fetch-Site: cross-site"
             ]
             if cookies:
                 cookie_str = "; ".join([f"{k}={v}" for k, v in cookies.items()])
@@ -126,11 +130,23 @@ class Downloader:
             "--check-segments-count", "False"
         ]
 
+        header_list = [
+            f"User-Agent: {CHROME_UA}",
+            f"Origin: {origin}",
+            f"Referer: {origin}/"
+        ]
+        if cookies:
+            cookie_str = "; ".join([f"{k}={v}" for k, v in cookies.items()])
+            header_list.append(f"Cookie: {cookie_str}")
+
         if is_ruutu:
+            # FORCE standard referer for Ruutu, otherwise Nelonen CDN rejects with 401 (Unauthorized)
+            ruutu_headers.append("Referer: https://www.ruutu.fi/")
             for h in ruutu_headers:
                 cmd.extend(["-H", h])
         else:
-            cmd.extend(["--header", header_str])
+            for h in header_list:
+                cmd.extend(["-H", h])
 
         # Handle Subtitles
         if skip_subs:
@@ -284,25 +300,31 @@ class Downloader:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
                 
-                # Assembly
-                out_files = [f for f in os.listdir(work_dir) if f.endswith(".mkv") or f.endswith(".mp4")]
-                if not out_files: return False
+                # Filename detection (yt-dlp might change extension or name)
+                out_files = [f for f in os.listdir(work_dir) if f.endswith(".mkv") or f.endswith(".mp4") or f.endswith(".ts")]
+                if not out_files:
+                    progress.console.log(f"[bold red]ERROR[/bold red]    [DOWNLOADER] No output file found in {work_dir}")
+                    return False
                 
                 temp_mkv = os.path.join(work_dir, out_files[0])
                 if os.path.exists(temp_mkv):
                     if os.path.exists(final_dest): os.remove(final_dest)
+                    
                     # Retry loop for Windows IO locks
                     for i in range(5):
                         try:
                             shutil.move(temp_mkv, final_dest)
                             progress.console.log(f"[bold green]INFO[/bold green]     [DOWNLOADER] Saved to: {final_dest}")
                             return True
-                        except PermissionError: time.sleep(1)
+                        except PermissionError: 
+                            time.sleep(2) # Give it 2s for file release
                     
                     # Last ditch effort
-                    shutil.copy2(temp_mkv, final_dest)
-                    os.remove(temp_mkv)
-                    return True
+                    try:
+                        shutil.copy2(temp_mkv, final_dest)
+                        os.remove(temp_mkv)
+                        return True
+                    except: pass
                 return False
             except Exception as e:
                 logging.error(f"[DOWNLOADER] yt-dlp strategy failed: {e}")
