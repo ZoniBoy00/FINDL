@@ -11,9 +11,9 @@ from rich.progress import (
     DownloadColumn, TransferSpeedColumn, TimeRemainingColumn
 )
 
-from ..config import NM3U8DL_RE_PATH, SHAKA_PACKAGER_PATH, TEMP_DIR, CHROME_UA, DEFAULT_HEADERS
-from ..ui.display import UI, console
-from .subtitles import SubtitleManager
+from findl.config import NM3U8DL_RE_PATH, SHAKA_PACKAGER_PATH, TEMP_DIR, CHROME_UA, DEFAULT_HEADERS
+from findl.ui.display import UI, console
+from findl.core.subtitles import SubtitleManager
 
 class Downloader:
     """
@@ -73,6 +73,7 @@ class Downloader:
         effective_referer = (original_url if original_url else f"{effective_origin}/")
 
         # Build headers for the download command
+        ruutu_headers = []
         if is_ruutu:
             # High-stealth browser imitation for Ruutu (Nelonen)
             ruutu_headers = [
@@ -113,14 +114,15 @@ class Downloader:
         cmd = [
             self.exe, manifest_url,
             "-mt",
-            "--thread-count", "8", # Reduced for stealth (avoid 401 rate limits)
+            "--thread-count", "64",
             "--concurrent-download", "True",
             "--download-retry-count", "30",
+            "--http-request-timeout", "120",
             "--decryption-engine", "SHAKA_PACKAGER",
             "--decryption-binary-path", self.packager,
             "--select-video", "best",
             "--select-audio", "best",
-            "--mux-after-done", "format=mkv",
+            "-M", "format=mkv",
             "--save-name", temp_title,
             "--save-dir", rel_output,
             "--tmp-dir", download_tmp,
@@ -133,14 +135,19 @@ class Downloader:
         header_list = [
             f"User-Agent: {CHROME_UA}",
             f"Origin: {origin}",
-            f"Referer: {origin}/"
+            f"Referer: {origin}/",
+            "Accept-Encoding: gzip, deflate",
+            "Cache-Control: no-cache"
         ]
         if cookies:
             cookie_str = "; ".join([f"{k}={v}" for k, v in cookies.items()])
             header_list.append(f"Cookie: {cookie_str}")
 
         if is_ruutu:
-            # FORCE standard referer for Ruutu, otherwise Nelonen CDN rejects with 401 (Unauthorized)
+            # High-stealth browser imitation for Ruutu (Nelonen)
+            # Add token first to ruutu_headers (before the duplicate check later)
+            if token:
+                ruutu_headers.append(f"X-AxDRM-Message: {token}")
             ruutu_headers.append("Referer: https://www.ruutu.fi/")
             for h in ruutu_headers:
                 cmd.extend(["-H", h])
@@ -203,134 +210,97 @@ class Downloader:
         work_tmpl = os.path.join(work_dir, "video.%(ext)s")
         final_dest = os.path.join(self.output_dir, f"{clean_title}.mkv")
         
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(bar_width=45),
-            "[progress.percentage]{task.percentage:>3.0f}%",
-            "•",
-            DownloadColumn(),
-            "•",
-            TransferSpeedColumn(),
-            "•",
-            TimeRemainingColumn(),
-            console=console,
-            transient=True
-        ) as progress:
-            
-            dl_task = progress.add_task("Downloading", total=None)
-            pp_task = progress.add_task("Post-processing", total=None, visible=False)
+        ydl_headers = {}
+        if cookies or license_headers:
+            for k, v in (license_headers or {}).items():
+                if k.lower() not in ['user-agent', 'referer', 'origin']:
+                    ydl_headers[k] = v
 
-            def ytdlp_progress_hook(d):
-                if d['status'] == 'downloading':
-                    downloaded = d.get('downloaded_bytes', 0)
-                    total = d.get('total_bytes') or d.get('total_bytes_estimate')
-                    progress.update(dl_task, completed=downloaded, total=total, speed=d.get('speed'))
-                elif d['status'] == 'finished':
-                    downloaded = d.get('downloaded_bytes', 100)
-                    progress.update(dl_task, completed=downloaded, total=downloaded, description="[bold green]Download Complete")
-
-            def ytdlp_post_hook(d):
-                if d['status'] == 'started':
-                    pp_name = d.get('postprocessor', 'Processor')
-                    desc_map = {"EmbedSubtitle": "Embedding Subtitles", "SubtitlesConvertor": "Converting to SRT", "Metadata": "Writing Metadata"}
-                    for key, val in desc_map.items():
-                        if key in pp_name:
-                            pp_name = val
-                            break
-                    progress.update(pp_task, visible=True, description=f"[bold yellow]{pp_name}")
-                elif d['status'] == 'finished':
-                    progress.update(pp_task, completed=1, total=1, description="[bold green]Finished")
-
-            # Mix headers and cookies into ydl_opts
-            ydl_headers = {
-                'User-Agent': CHROME_UA,
-                'Referer': original_url or "https://areena.yle.fi/",
-                'Origin': 'https://areena.yle.fi'
+        ydl_opts = {
+            'format': 'bestvideo+bestaudio/best',
+            'outtmpl': work_tmpl,
+            'quiet': True,
+            'no_warnings': True,
+            'ignoreerrors': True,
+            'nocheckcertificate': True,
+            'merge_output_format': 'mkv',
+            'noplaylist': True,
+            'extractor_args': {'generic': {'impersonate': 'chrome'}},
+            'socket_timeout': 60,
+            'retries': 10,
+            'http_headers': ydl_headers,
+            'noprogress': True,
+            'overwrites': True,
+            'nopart': True,
+            'updatetime': False,
+            'windowsfilenames': True,
+            'http_header_overrides': {
+                'hls': {
+                    'User-Agent': CHROME_UA,
+                    'Referer': 'https://areena.yle.fi/',
+                    'Origin': 'https://areena.yle.fi'
+                } if 'yle' in (original_url or url).lower() else {}
             }
-            if license_headers:
-                for k, v in license_headers.items():
-                    if k.lower() not in ['user-agent', 'referer', 'origin']:
-                        ydl_headers[k] = v
+        }
+        
+        if not skip_subs:
+            ydl_opts['writesubtitles'] = True
+            ydl_opts['writeautomaticsub'] = True
+            ydl_opts['subtitleslangs'] = ['fi', 'sv', 'en', 'und']
+            ydl_opts['subtitlesformat'] = 'srt'
+        
+        # Pass cookies if available
+        if cookies:
+            # Determine domain: if URL has 'yle', use .yle.fi
+            target_domain = ".yle.fi" if "yle.fi" in (original_url or url).lower() else ".mtv.fi"
+            ydl_opts['cookiefile'] = self._write_temp_cookies(cookies, domain=target_domain)
 
-            ydl_opts = {
-                'format': 'bestvideo+bestaudio/best',
-                'outtmpl': work_tmpl,
-                'quiet': True,
-                'no_warnings': True,
-                'ignoreerrors': True,
-                'nocheckcertificate': True,
-                'merge_output_format': 'mkv',
-                'noplaylist': True,
-                'force_generic_extractor': True, # Bypass broken/blocked Ruutu-specific extractor
-                'extractor_args': {'generic': {'impersonate': 'chrome'}},
-                'socket_timeout': 30,
-                'retries': 10,
-                'http_headers': ydl_headers,
-                'noprogress': True,
-                'overwrites': True,
-                'nopart': True,              
-                'updatetime': False,         
-                'windowsfilenames': True,    
-                'writesubtitles': not skip_subs,      
-                'writeautomaticsub': not skip_subs,   
-                'subtitleslangs': ['fi.*', 'suo.*', 'en.*', 'und.*'],   
-                'subtitlesformat': 'srt/vtt/best',
-                'concurrent_fragment_downloads': 8, # Reduced for stability on Akamai
-                'fragment_retries': 15,
-                'skip_unavailable_fragments': True,
-                'socket_timeout': 60,
-                'add_metadata': True,
-                'progress_hooks': [ytdlp_progress_hook],
-                'postprocessor_hooks': [ytdlp_post_hook],
-                'postprocessors': [
-                    {'key': 'FFmpegSubtitlesConvertor', 'format': 'srt'},
-                    {'key': 'FFmpegEmbedSubtitle'}
-                ]
-            }
+        try:
+            console.log(f"[bold cyan]INFO[/bold cyan]     [DOWNLOADER] Engaging yt-dlp engine...")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
             
-            # Pass cookies if available
-            if cookies:
-                # Determine domain: if URL has 'yle', use .yle.fi
-                target_domain = ".yle.fi" if "yle.fi" in (original_url or url).lower() else ".mtv.fi"
-                ydl_opts['cookiefile'] = self._write_temp_cookies(cookies, domain=target_domain)
-
+            # Filename detection (yt-dlp might change extension or name)
+            temp_video = os.path.join(work_dir, "video.mkv")
+            if not os.path.exists(temp_video):
+                # Try to find any mkv in work dir
+                for f in os.listdir(work_dir):
+                    if f.endswith('.mkv'):
+                        temp_video = os.path.join(work_dir, f)
+                        break
+            
+            if os.path.exists(temp_video):
+                # Move to final destination
+                if os.path.exists(final_dest):
+                    os.remove(final_dest)
+                shutil.move(temp_video, final_dest)
+                
+                # Copy subtitle files if they exist
+                if not skip_subs:
+                    for sub_file in os.listdir(work_dir):
+                        if sub_file.endswith(('.srt', '.vtt')):
+                            sub_ext = '.srt' if sub_file.endswith('.srt') else '.vtt'
+                            sub_lang = sub_file.replace('video.', '').replace('.srt', '').replace('.vtt', '')
+                            dest_sub = os.path.join(self.output_dir, f"{clean_title}.{sub_lang}{sub_ext}")
+                            if not os.path.exists(dest_sub):
+                                try:
+                                    shutil.copy(os.path.join(work_dir, sub_file), dest_sub)
+                                except: pass
+                
+                console.log(f"[bold cyan]INFO[/bold cyan]     [DOWNLOADER] Saved to: {final_dest}")
+                return True
+            else:
+                console.log(f"[bold red]ERROR[/bold red]     [DOWNLOADER] yt-dlp strategy failed: No output file found")
+                return False
+                
+        except Exception as e:
+            console.log(f"[bold red]ERROR[/bold red]     [DOWNLOADER] yt-dlp strategy failed: {e}")
+            return False
+        finally:
+            # Cleanup
             try:
-                progress.console.log(f"[bold cyan]INFO[/bold cyan]     [DOWNLOADER] Engaging yt-dlp engine...")
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
-                
-                # Filename detection (yt-dlp might change extension or name)
-                out_files = [f for f in os.listdir(work_dir) if f.endswith(".mkv") or f.endswith(".mp4") or f.endswith(".ts")]
-                if not out_files:
-                    progress.console.log(f"[bold red]ERROR[/bold red]    [DOWNLOADER] No output file found in {work_dir}")
-                    return False
-                
-                temp_mkv = os.path.join(work_dir, out_files[0])
-                if os.path.exists(temp_mkv):
-                    if os.path.exists(final_dest): os.remove(final_dest)
-                    
-                    # Retry loop for Windows IO locks
-                    for i in range(5):
-                        try:
-                            shutil.move(temp_mkv, final_dest)
-                            progress.console.log(f"[bold green]INFO[/bold green]     [DOWNLOADER] Saved to: {final_dest}")
-                            return True
-                        except PermissionError: 
-                            time.sleep(2) # Give it 2s for file release
-                    
-                    # Last ditch effort
-                    try:
-                        shutil.copy2(temp_mkv, final_dest)
-                        os.remove(temp_mkv)
-                        return True
-                    except: pass
-                return False
-            except Exception as e:
-                logging.error(f"[DOWNLOADER] yt-dlp strategy failed: {e}")
-                return False
-            finally:
                 shutil.rmtree(work_dir, ignore_errors=True)
+            except: pass
 
     def _sanitize_title(self, title):
         """Clean title for file system."""

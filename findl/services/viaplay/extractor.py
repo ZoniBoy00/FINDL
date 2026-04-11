@@ -6,9 +6,9 @@ import logging
 import json
 from playwright.sync_api import sync_playwright
 from pywidevine.license_protocol_pb2 import SignedMessage, LicenseRequest
-from .base import BaseExtractor
-from ..config import CHROME_UA, SESSION_DIR
-from ..ui.display import UI
+from ..base import BaseExtractor
+from ...config import CHROME_UA, SESSION_DIR
+from ...ui.display import UI
 
 class ViaplayExtractor(BaseExtractor):
     def get_service_name(self):
@@ -192,7 +192,11 @@ class ViaplayExtractor(BaseExtractor):
                 "subtitles": [],
                 "cookies": {},
                 "origin": "https://viaplay.fi",
-                "metadata": {}
+                "metadata": {},
+                "series": None,
+                "season": None,
+                "episode": None,
+                "is_movie": True
             }
 
             def handle_response(response):
@@ -336,7 +340,10 @@ class ViaplayExtractor(BaseExtractor):
                 
                 # Try to trigger playback even if button click failed
                 if (time.time() - start) > 15:
-                    page.evaluate("if(document.querySelector('video')) document.querySelector('video').play()")
+                    page.evaluate("""
+                        var v = document.querySelector('video');
+                        if(v) { v.muted = true; v.play(); }
+                    """)
                     
                 page.wait_for_timeout(1500)
 

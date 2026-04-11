@@ -4,7 +4,7 @@ import requests
 import logging
 import subprocess
 import shutil
-from ..config import NM3U8DL_RE_PATH, CHROME_UA
+from findl.config import NM3U8DL_RE_PATH, CHROME_UA
 
 class SubtitleManager:
     def __init__(self, output_dir="downloads", languages=["fi", "fin", "suomi", "qag"]):

@@ -5,7 +5,7 @@ import glob
 from pywidevine.cdm import Cdm
 from pywidevine.device import Device
 from pywidevine.pssh import PSSH
-from ..config import WVD_PATH, DEFAULT_HEADERS
+from findl.config import WVD_PATH, DEFAULT_HEADERS
 
 class DRMHandler:
     def __init__(self, wvd_path=WVD_PATH):

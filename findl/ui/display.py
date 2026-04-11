@@ -4,6 +4,7 @@ from rich.table import Table
 from rich.text import Text
 from rich.box import ROUNDED, DOUBLE_EDGE
 import time
+from findl.config import APP_VERSION
 
 console = Console()
 
@@ -17,9 +18,9 @@ class UI:
         banner_text.append(" ██╔══╝  ██║██║╚██╗██║██║  ██║██║     \n", style="bold white")
         banner_text.append(" ██║     ██║██║ ╚████║██████╔╝███████╗\n", style="bold blue")
         banner_text.append(" ╚═╝     ╚═╝╚═╝  ╚═══╝╚═════╝ ╚══════╝", style="bold blue")
-        
+
         panel = Panel(
-            Text.assemble(banner_text, "\n\n", (" Unified Video Downloader v2.1 ", "bold italic white on blue")),
+            Text.assemble(banner_text, "\n\n", (f" Unified Video Downloader v{APP_VERSION} ", "bold italic white on blue")),
             border_style="blue",
             box=DOUBLE_EDGE,
             padding=(1, 2)

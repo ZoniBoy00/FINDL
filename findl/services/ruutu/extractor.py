@@ -7,9 +7,9 @@ import requests
 from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright
 from pywidevine.license_protocol_pb2 import SignedMessage, LicenseRequest
-from .base import BaseExtractor
-from ..config import CHROME_UA, SESSION_DIR, TEMP_DIR
-from ..ui.display import UI
+from findl.services.base import BaseExtractor
+from findl.config import CHROME_UA, SESSION_DIR, TEMP_DIR
+from findl.ui.display import UI
 
 class RuutuExtractor(BaseExtractor):
     def get_service_name(self):
@@ -105,12 +105,21 @@ class RuutuExtractor(BaseExtractor):
                         full_url = "https://www.ruutu.fi" + (href if href.startswith("/") else "/" + href)
                         
                         if existing_index is None:
+                            season_from_title = None
+                            season_match_in_title = re.search(r'Kausi\s*(\d+)|Season\s*(\d+)', title, re.I)
+                            if season_match_in_title:
+                                season_from_title = season_match_in_title.group(1) or season_match_in_title.group(2)
+                            
+                            final_season = current_season
+                            if season_from_title:
+                                final_season = f"Kausi {season_from_title}"
+                            
                             episodes.append({
                                 "id": video_id,
                                 "url": full_url,
                                 "title": title,
                                 "series": series_title,
-                                "season": current_season or "Kausi 1"
+                                "season": final_season
                             })
                             seen_ids.add(video_id)
                         else:
@@ -193,6 +202,16 @@ class RuutuExtractor(BaseExtractor):
                     page.wait_for_timeout(1500)
 
             browser.close()
+            
+            def get_sort_key(ep):
+                season_str = ep.get('season', 'Kausi 1')
+                season_num = int(re.search(r'\d+', season_str).group()) if re.search(r'\d+', season_str) else 1
+                title = ep.get('title', '')
+                episode_num = int(re.search(r'\d+', title).group()) if re.search(r'\d+', title) else 0
+                return (season_num, episode_num)
+            
+            episodes.sort(key=get_sort_key)
+            
             return episodes
 
     def extract(self, url):
@@ -211,19 +230,7 @@ class RuutuExtractor(BaseExtractor):
             )
             page = context.pages[0] if context.pages else context.new_page()
 
-            # Anti-detection script
-            page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                window.chrome = { runtime: {} };
-                Object.defineProperty(navigator, 'languages', {get: () => ['fi-FI', 'fi']});
-            """)
-
-            # Anti-detection
-            page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                window.chrome = { runtime: {} };
-                Object.defineProperty(navigator, 'languages', {get: () => ['fi-FI', 'fi']});
-            """)
+            self._add_anti_detection(page)
 
             # Relaxed Ad-Blocker (Let video load, block obvious trackers)
             def intercept(route):
@@ -327,39 +334,78 @@ class RuutuExtractor(BaseExtractor):
                 og_title = page.locator('meta[property="og:title"]').get_attribute('content')
                 result["title"] = (og_title or page.title()).split("|")[0].strip()
                 result["title"] = re.sub(r'[^\w\s-]', '', result["title"]).strip().replace(" ", "_")
+                
+                result["series"] = page.evaluate("""() => {
+                    // Check if this is a single movie by URL pattern
+                    if (window.location.href.includes('/video/')) return null;
+                    if (window.location.href.includes('/movie/')) return null;
+                    
+                    // Try breadcrumb for series
+                    const bread = Array.from(document.querySelectorAll('a[href*="/ohjelmat/"]'))
+                        .map(a => a.innerText.trim())
+                        .filter(t => t.length > 2);
+                    if (bread.length > 0) return bread[0];
+                    return null;
+                }""")
+                
+                result["season"] = page.evaluate(r"""() => {
+                    // If it's a movie, no season
+                    if (window.location.href.includes('/video/')) return null;
+                    if (window.location.href.includes('/movie/')) return null;
+                    const text = document.body.innerText;
+                    const match = text.match(/Kausi\s+(\d+)/i) || text.match(/Season\s+(\d+)/i);
+                    return match ? match[0] : null;
+                }""")
+                
+                result["episode"] = page.evaluate(r"""() => {
+                    // If it's a movie, no episode
+                    if (window.location.href.includes('/video/')) return null;
+                    if (window.location.href.includes('/movie/')) return null;
+                    const text = document.body.innerText;
+                    const match = text.match(/Jakso\s+(\d+)/i) || text.match(/Episode\s+(\d+)/i);
+                    return match ? parseInt(match[1]) : null;
+                }""")
+                
+                result["is_movie"] = not bool(result.get("series"))
             except: pass
             
             # Interactive Play & Wait for Cookies to Settle
             UI.print_step("Waiting for license data (skip ads)...", "running")
             start = time.time()
-            while time.time() - start < 90:
+            while time.time() - start < 60:
                 elapsed = int(time.time() - start)
                 if elapsed % 15 == 0 and elapsed > 0:
                     UI.print_step(f"Still waiting... ({elapsed}s) Check if login/play is needed.", "running")
                     
                 if result["manifest_url"] and (result["drm_token"] or result["license_url"]):
-                    # Wait a bit longer to ensure cookies are fully set
-                    page.wait_for_timeout(5000)
+                    page.wait_for_timeout(3000)
                     UI.print_step("Manifest & License found, finalizing...", "running")
                     break
+                
+                # Try to extract directly from page if we have video element
+                if page.locator("video").count() > 0:
+                    try:
+                        src = page.evaluate("document.querySelector('video').src")
+                        if src and "manifest" in src:
+                            result["manifest_url"] = src
+                            logging.info(f"[RUUTU] Found manifest from video element")
+                    except: pass
                 
                 # Fast-forward ads
                 try:
-                    page.evaluate("document.querySelectorAll('video').forEach(v => { v.muted = true; v.playbackRate = 16; });")
+                    page.evaluate("""
+                        document.querySelectorAll('video').forEach(v => { 
+                            v.muted = true; 
+                            v.playbackRate = 16; 
+                        });
+                    """)
                 except: pass
 
-                # Priority logic: Try to find a master or gatekeeper first
-                if result["manifest_url"]:
-                    if "master" in result["manifest_url"] or "gatekeeper" in result["manifest_url"]:
-                         # We have a high-quality manifest, but keep waiting for PSSH
-                         pass
-                
                 if result["manifest_url"] and (result["psshs"] or result["license_url"]):
-                    # Wait a bit longer to ensure cookies are fully set
-                    page.wait_for_timeout(5000)
+                    page.wait_for_timeout(3000)
                     UI.print_step("Manifest & License found, finalizing...", "running")
                     break
-                page.wait_for_timeout(1000)
+                page.wait_for_timeout(1500)
 
             # Deep Scan: Try to find PSSH in manifest if sniffing failed
             if result["manifest_url"]:

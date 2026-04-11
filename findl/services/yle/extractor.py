@@ -4,9 +4,9 @@ import logging
 import re
 import requests
 from playwright.sync_api import sync_playwright
-from .base import BaseExtractor
-from ..config import CHROME_UA, SESSION_DIR
-from ..ui.display import UI
+from findl.services.base import BaseExtractor
+from findl.config import CHROME_UA, SESSION_DIR
+from findl.ui.display import UI
 
 class YleExtractor(BaseExtractor):
     def get_service_name(self):
@@ -231,7 +231,11 @@ class YleExtractor(BaseExtractor):
                 "license_headers": {},
                 "psshs": [],
                 "pssh": None,
-                "origin": "https://areena.yle.fi"
+                "origin": "https://areena.yle.fi",
+                "series": None,
+                "season": None,
+                "episode": None,
+                "is_movie": True
             }
 
             # If yt-dlp didn't find manifest in 'url', check 'formats'

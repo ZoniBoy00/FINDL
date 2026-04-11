@@ -6,9 +6,9 @@ import logging
 import requests
 from playwright.sync_api import sync_playwright
 from pywidevine.license_protocol_pb2 import SignedMessage, LicenseRequest
-from .base import BaseExtractor
-from ..config import CHROME_UA, SESSION_DIR, TEMP_DIR
-from ..ui.display import UI
+from findl.services.base import BaseExtractor
+from findl.config import CHROME_UA, SESSION_DIR, TEMP_DIR
+from findl.ui.display import UI
 
 class KatsomoExtractor(BaseExtractor):
     def get_service_name(self):
@@ -108,7 +108,16 @@ class KatsomoExtractor(BaseExtractor):
                                 
                             if not title or len(title) < 2:
                                 title = f"Episode {video_id[:8]}"
-
+                            
+                            season_from_title = None
+                            season_match_in_title = re.search(r'Kausi\s*(\d+)|Season\s*(\d+)', title, re.I)
+                            if season_match_in_title:
+                                season_from_title = season_match_in_title.group(1) or season_match_in_title.group(2)
+                            
+                            final_season = current_season
+                            if season_from_title:
+                                final_season = f"Kausi {season_from_title}"
+                            
                             full_url = href
                             if not href.startswith("http"):
                                 full_url = "https://www.mtv.fi" + (href if href.startswith("/") else "/" + href)
@@ -118,7 +127,7 @@ class KatsomoExtractor(BaseExtractor):
                                 "url": full_url,
                                 "title": title,
                                 "series": series_title,
-                                "season": current_season or "Season 1"
+                                "season": final_season
                             })
                             seen_ids.add(video_id)
 
@@ -178,6 +187,16 @@ class KatsomoExtractor(BaseExtractor):
                 extract_visible()
             
             browser.close()
+            
+            def get_sort_key(ep):
+                season_str = ep.get('season', 'Kausi 1')
+                season_num = int(re.search(r'\d+', season_str).group()) if re.search(r'\d+', season_str) else 1
+                title = ep.get('title', '')
+                episode_num = int(re.search(r'\d+', title).group()) if re.search(r'\d+', title) else 0
+                return (season_num, episode_num)
+            
+            episodes.sort(key=get_sort_key)
+            
             return episodes
 
     def extract(self, url):
@@ -206,19 +225,7 @@ class KatsomoExtractor(BaseExtractor):
             )
             page = context.pages[0] if context.pages else context.new_page()
 
-            # Anti-detection script
-            page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                window.chrome = { runtime: {} };
-                Object.defineProperty(navigator, 'languages', {get: () => ['fi-FI', 'fi']});
-            """)
-
-            # Anti-detection script
-            page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                window.chrome = { runtime: {} };
-                Object.defineProperty(navigator, 'languages', {get: () => ['fi-FI', 'fi']});
-            """)
+            self._add_anti_detection(page)
 
             result = {
                 "title": None,
@@ -375,29 +382,36 @@ class KatsomoExtractor(BaseExtractor):
 
             # Extract Metadata
             try:
-                # Find series/season from breadcrumbs or metadata
                 result["series"] = page.evaluate("""() => {
-                    // Try Breadcrumbs
+                    // Check if this is a movie by URL pattern
+                    if (window.location.href.includes('/video/')) return null;
+                    
                     const bread = Array.from(document.querySelectorAll('a[href*="/sarja/"], a[href*="/ohjelma/"]'))
                         .map(a => a.innerText.trim())
                         .filter(t => t.length > 2);
                     if (bread.length > 0) return bread[0];
                     
-                    // Try page title prefix
                     const title = document.title.split('|')[0].trim();
                     if (title.includes(':')) return title.split(':')[0].trim();
                     
-                    return "Katsomo_Sarja";
+                    return null;
                 }""")
                 
                 result["season"] = page.evaluate(r"""() => {
                     const text = document.body.innerText;
                     const match = text.match(/Kausi\s+(\d+)/i) || text.match(/Season\s+(\d+)/i);
-                    return match ? match[0] : "Kausi 1";
+                    return match ? match[0] : null;
                 }""")
                 
+                result["episode"] = page.evaluate(r"""() => {
+                    const text = document.body.innerText;
+                    const match = text.match(/Jakso\s+(\d+)/i) || text.match(/Episode\s+(\d+)/i);
+                    return match ? parseInt(match[1]) : null;
+                }""")
+                
+                result["is_movie"] = not bool(result.get("series"))
+                
                 og_title = page.locator('meta[property="og:title"]').get_attribute('content')
-                # For single episodes, the title is usually "Jakso X - Title"
                 raw_title = (og_title or page.title()).split("|")[0].strip()
                 if ":" in raw_title: raw_title = raw_title.split(":", 1)[-1].strip()
                 
@@ -424,7 +438,10 @@ class KatsomoExtractor(BaseExtractor):
                     
                 if (time.time() - start) > 15 and not result["license_url"]:
                     try:
-                        page.evaluate("if(document.querySelector('video')) document.querySelector('video').play()")
+                        page.evaluate("""
+                            var v = document.querySelector('video');
+                            if(v) { v.muted = true; v.play(); }
+                        """)
                     except: pass
                     
                 page.wait_for_timeout(1000)

@@ -1,8 +1,5 @@
 from .core.downloader import Downloader
 from .core.drm import DRMHandler
-from .services.katsomo import KatsomoExtractor
-from .services.ruutu import RuutuExtractor
-from .services.yle import YleExtractor
-from .services.viaplay import ViaplayExtractor
+from .services import KatsomoExtractor, RuutuExtractor, YleExtractor, ViaplayExtractor
 
-__version__ = "2.1.0"
+__version__ = "0.0.2"
