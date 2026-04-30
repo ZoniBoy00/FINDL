@@ -164,16 +164,43 @@ class BaseExtractor(ABC):
                     logger.info(f"[{self.SERVICE_NAME}] Found PSSH via pssh= attribute")
                     return pssh
             
-            patterns = [
-                r'<(?:[a-zA-Z0-9]+:)?pssh[^>]*>(.*?)</(?:[a-zA-Z0-9]+:)?pssh>', 
-                r'cenc:pssh>(.*?)</cenc:pssh>',
-            ]
-            for p in patterns:
-                match = re.search(p, content, re.I | re.S)
-                if match:
-                    pssh = match.group(1).strip()
-                    logger.info(f"[{self.SERVICE_NAME}] Found PSSH via DASH Pattern")
-                    return pssh
+            # DASH PSSH extraction - MUST filter for Widevine System ID
+            # Widevine System ID: edef8ba9-79d6-4ace-a3c8-27dcd51d21ed
+            widevine_pssh = None
+            
+            # Strategy 1: Find PSSH inside Widevine-specific ContentProtection block
+            cp_blocks = re.findall(
+                r'<ContentProtection[^>]*schemeIdUri="urn:uuid:edef8ba9[^"]*"[^>]*>(.*?)</ContentProtection>',
+                content, re.I | re.S
+            )
+            for block in cp_blocks:
+                m = re.search(r'<(?:[a-zA-Z0-9]+:)?pssh[^>]*>(.*?)</(?:[a-zA-Z0-9]+:)?pssh>', block, re.I | re.S)
+                if m:
+                    widevine_pssh = m.group(1).strip()
+                    break
+            
+            # Strategy 2: Check all PSSH elements and verify system ID bytes
+            if not widevine_pssh:
+                all_psshs_found = re.findall(r'<(?:[a-zA-Z0-9]+:)?pssh[^>]*>(.*?)</(?:[a-zA-Z0-9]+:)?pssh>', content, re.I | re.S)
+                widevine_sys_bytes = bytes.fromhex("edef8ba979d64acea3c827dcd51d21ed")
+                for candidate in all_psshs_found:
+                    candidate = candidate.strip()
+                    if not candidate:
+                        continue
+                    try:
+                        decoded = base64.b64decode(candidate)
+                        if widevine_sys_bytes in decoded:
+                            widevine_pssh = candidate
+                            break
+                    except:
+                        pass
+                # Fallback: take the last one (Widevine often comes after PlayReady)
+                if not widevine_pssh and all_psshs_found:
+                    widevine_pssh = all_psshs_found[-1].strip()
+            
+            if widevine_pssh:
+                logger.info(f"[{self.SERVICE_NAME}] Found Widevine PSSH via DASH Pattern")
+                return widevine_pssh
 
             common_pssh_matches = re.findall(r'([a-zA-Z0-9+/=]{60,})', content)
             for candidate in common_pssh_matches:

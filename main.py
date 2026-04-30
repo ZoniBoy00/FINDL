@@ -70,6 +70,7 @@ def format_series_title(info, ep=None):
             episode_str = f"E{int(ep.get('episode')):02d}"
         
         series_name = sanitize_path_name(series)
+        series_name = re.sub(r'[^A-Z0-9]', '', series_name.upper())
         return f"{series_name}{season_str}{episode_str}_{title}"
     
     return title
@@ -85,13 +86,15 @@ def get_folder_structure(info, ep=None):
     
     if series:
         series_name = sanitize_path_name(series)
+        series_name = re.sub(r'[^A-Z0-9]', '', series_name.upper())
         season_name = sanitize_path_name(season) if season else "Season 1"
         return os.path.join(series_name, season_name)
     
     return None
 
 # Local Imports
-from findl import KatsomoExtractor, RuutuExtractor, YleExtractor, ViaplayExtractor, DRMHandler, Downloader
+from findl import KatsomoExtractor, RuutuExtractor, YleExtractor, ViaplayExtractor, SfAnytimeExtractor, DRMHandler, Downloader
+
 from findl.ui.display import UI, console
 from findl.config import LOG_DIR
 
@@ -115,13 +118,146 @@ logging.basicConfig(
 @click.option('--title', help='Video title')
 @click.option('--pssh', help='Manual PSSH override')
 @click.option('--no-subs', is_flag=True, help='Skip downloading subtitles')
-def main(url, output, title, pssh, no_subs):
+@click.option('--keys', multiple=True, help='Manual DRM keys (format: kid:key)')
+@click.option('--key-file', help='File containing DRM keys (one per line)')
+def main(url, output, title, pssh, no_subs, keys, key_file):
     """FINDL - Ultimate Video Downloader for Finnish Services"""
     
     UI.banner()
     
     if not url:
         UI.error("Please provide a URL to download.")
+        return
+
+    # Load keys from file if provided
+    file_keys = []
+    if key_file and os.path.exists(key_file):
+        with open(key_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and ':' in line:
+                    file_keys.append(line)
+    
+    # Combine CLI keys and file keys
+    all_keys = list(keys) + file_keys
+    
+    # Manual keys provided via --keys option or --key-file
+    if all_keys:
+        UI.print_step(f"Using manually provided keys: {len(all_keys)}", "info")
+        for k in all_keys:
+            UI.print_step(f"  Key: {k}", "info")
+        
+        # Extract info but skip DRM
+        extractor = None
+        if "mtv.fi" in url or "katsomo.fi" in url:
+            extractor = KatsomoExtractor()
+        elif "ruutu.fi" in url:
+            extractor = RuutuExtractor()
+        elif "areena.yle.fi" in url:
+            extractor = YleExtractor()
+        elif "viaplay." in url:
+            extractor = ViaplayExtractor()
+        elif "sfanytime.com" in url:
+            extractor = SfAnytimeExtractor()
+        else:
+            UI.error("Unsupported service.")
+            return
+        
+        with UI.status("Analyzing target...") as status:
+            info = extractor.extract(url)
+        
+        if not info or not info.get("manifest_url"):
+            UI.error("Extraction failed.")
+            return
+        
+        base_output = output or "downloads"
+        
+        # Get proper title from info - try multiple sources
+        if not title:
+            # Try to get series name from URL first
+            series_match = re.search(r'/sarjat/([^/]+)', url)
+            if series_match:
+                series_name = series_match.group(1).replace('.', ' ').upper().strip()
+                # Clean up series name (e.g., "s.w.a.t." -> "SWAT")
+                series_name = re.sub(r'[^A-Z0-9]', '', series_name)
+                
+                # Get season and episode from URL
+                season_match = re.search(r'kausi-(\d+)', url)
+                season_num = int(season_match.group(1)) if season_match else 1
+                
+                ep_match = re.search(r'jakso-(\d+)', url)
+                ep_num = int(ep_match.group(1)) if ep_match else 1
+                
+                title = f"{series_name}_S{season_num:02d}E{ep_num:02d}"
+            
+            # Fallback to info title
+            if not title and info.get("title"):
+                title = info.get("title")
+        
+        if not title:
+            title = "Episode"
+        
+        # Handle folder structure
+        if info.get("series"):
+            series_name = sanitize_path_name(info.get("series"))
+            # Remove all spaces for clean folder names (e.g., "S W A T" -> "SWAT")
+            series_name = re.sub(r'[^A-Z0-9]', '', series_name.upper())
+            season_name = sanitize_path_name(info.get("season", "Season 1"))
+            effective_output = os.path.join(base_output, series_name, season_name)
+            os.makedirs(effective_output, exist_ok=True)
+        else:
+            # Try to get series name from URL
+            series_match = re.search(r'/sarjat/([^/]+)', url)
+            if series_match:
+                series_name = series_match.group(1).replace('.', ' ').strip()
+                # Clean up - convert "s w a t" or "s.w.a.t." to "SWAT"
+                series_clean = re.sub(r'[^A-Z0-9]', '', series_name.upper())
+                
+                season_match = re.search(r'kausi-(\d+)', url)
+                season_name = f"Season {season_match.group(1)}" if season_match else "Season 1"
+                
+                effective_output = os.path.join(base_output, series_clean, season_name)
+                os.makedirs(effective_output, exist_ok=True)
+            else:
+                effective_output = base_output
+        
+        subtitles = [] if no_subs else info.get("subtitles", [])
+        
+        UI.playback_table(info)
+        
+        final_title = title or format_series_title(info)
+        
+        UI.key_panel(all_keys)
+        UI.download_session(final_title, effective_output, all_keys, subtitles)
+        
+        downloader = Downloader(output_dir=effective_output)
+        start_time = time.time()
+        
+        # Don't pass cookies for Viaplay - causes 400 errors
+        passed_cookies = None
+        if "viaplay." in url:
+            passed_cookies = None
+        else:
+            passed_cookies = info.get("cookies")
+        
+        success = downloader.download(
+            info["manifest_url"], 
+            all_keys, 
+            title=final_title, 
+            subtitles=subtitles,
+            origin=info.get("origin", "https://www.mtv.fi"),
+            skip_subs=no_subs,
+            use_ytdlp=False,
+            original_url=url,
+            cookies=passed_cookies,
+            token=info.get("drm_token"),
+            license_headers=info.get("license_headers")
+        )
+        
+        if success:
+            UI.success_panel(final_title, effective_output, time.time() - start_time)
+        else:
+            UI.error("Download failed.")
         return
 
     # Select Extractor
@@ -134,9 +270,10 @@ def main(url, output, title, pssh, no_subs):
         extractor = YleExtractor()
     elif "viaplay." in url:
         extractor = ViaplayExtractor()
-        UI.print_step("Viaplay support is currently WORK IN PROGRESS and may not work.", "warning")
+    elif "sfanytime.com" in url:
+        extractor = SfAnytimeExtractor()
     else:
-        UI.error("Unsupported service. Supported: Katsomo, Ruutu, Yle Areena, Viaplay.")
+        UI.error("Unsupported service. Supported: Katsomo, Ruutu, Yle Areena, Viaplay, SF Anytime.")
         return
 
     UI.print_step(f"Service: [bold green]{extractor.get_service_name()}[/bold green]", "info")
@@ -364,7 +501,29 @@ def process_single_url(url, extractor, output, title, pssh, no_subs, subfolder=N
         UI.error("Content is encrypted but no keys were acquired.")
         if not info.get("license_url"):
             UI.print_step("License URL was not found. Please try again and ensure you are logged in.", "error")
-        return
+            return
+        
+        # Prompt for manual keys if DRM failed
+        UI.print_step("DRM key acquisition failed. Enter keys manually:", "info")
+        UI.print_step("Format: KID:KEY (one per line)", "info")
+        UI.print_step("Example: 64593f85a63c5ed99deddfda1cc96715:9aa23e7adc85811a95680b0cc18015df", "info")
+        UI.print_step("Press Enter on empty line when done.", "info")
+        
+        manual_keys = []
+        while True:
+            key_input = input("Enter key (or press Enter to finish): ").strip()
+            if not key_input:
+                break
+            if ':' in key_input:
+                manual_keys.append(key_input)
+                UI.print_step(f"Added: {key_input[:20]}...", "success")
+        
+        if not manual_keys:
+            UI.error("No keys provided. Download cancelled.")
+            return
+        
+        keys = manual_keys
+        UI.key_panel(keys)
 
     # Download Setup
     final_title = title
@@ -383,6 +542,11 @@ def process_single_url(url, extractor, output, title, pssh, no_subs, subfolder=N
 
     logging.info(f"[MAIN] Strategy select: {'yt-dlp' if use_ytdlp else 'N_m3u8DL-RE'}")
     
+    # Don't pass cookies for Viaplay - causes 400 errors
+    passed_cookies = None
+    if "viaplay." not in url.lower():
+        passed_cookies = info.get("cookies")
+    
     success = downloader.download(
         info["manifest_url"], 
         keys, 
@@ -392,7 +556,7 @@ def process_single_url(url, extractor, output, title, pssh, no_subs, subfolder=N
         skip_subs=no_subs,
         use_ytdlp=use_ytdlp,
         original_url=url,
-        cookies=info.get("cookies"),
+        cookies=passed_cookies,
         token=info.get("drm_token"),
         license_headers=info.get("license_headers")
     )

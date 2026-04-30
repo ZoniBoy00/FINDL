@@ -69,7 +69,18 @@ class Downloader:
         
         # Determine service-specific origin & referer
         is_ruutu = "ruutu.fi" in manifest_url.lower() or "nelonenmedia" in manifest_url.lower()
-        effective_origin = "https://www.ruutu.fi" if is_ruutu else origin
+        is_sfanytime = "sfanytime.com" in manifest_url.lower() or (original_url and "sfanytime.com" in original_url.lower())
+        is_viaplay = "viaplay." in manifest_url.lower() or (original_url and "viaplay." in original_url.lower())
+        
+        if is_ruutu:
+            effective_origin = "https://www.ruutu.fi"
+        elif is_sfanytime:
+            effective_origin = "https://www.sfanytime.com"
+        elif is_viaplay:
+            effective_origin = "https://viaplay.fi"
+        else:
+            effective_origin = origin
+
         effective_referer = (original_url if original_url else f"{effective_origin}/")
 
         # Build headers for the download command
@@ -94,6 +105,23 @@ class Downloader:
             
             if token:
                 ruutu_headers.append(f"X-AxDRM-Message: {token}")
+        elif is_viaplay:
+            # Viaplay-specific headers - NO cookies for now (causes 400 errors)
+            viaplay_headers = [
+                f"User-Agent: {CHROME_UA}",
+                "Origin: https://viaplay.fi",
+                "Referer: https://viaplay.fi/",
+                "Accept: */*",
+                "Accept-Encoding: gzip, deflate",
+                "Cache-Control: no-cache"
+            ]
+            # Merge captured license headers (auth tokens etc.) if available
+            if license_headers:
+                for h, v in license_headers.items():
+                    h_lower = h.lower()
+                    # Avoid duplicates with static headers we already set
+                    if h_lower not in ('user-agent', 'origin', 'referer', 'accept', 'accept-encoding', 'cache-control', 'content-length', 'host', 'connection'):
+                        viaplay_headers.append(f"{h}: {v}")
         else:
             # Katsomo/Other RE based headers often need the pipe format for .NET stability
             header_str = f"User-Agent: {CHROME_UA}"
@@ -114,7 +142,7 @@ class Downloader:
         cmd = [
             self.exe, manifest_url,
             "-mt",
-            "--thread-count", "64",
+            "--thread-count", "16",
             "--concurrent-download", "True",
             "--download-retry-count", "30",
             "--http-request-timeout", "120",
@@ -143,6 +171,17 @@ class Downloader:
             cookie_str = "; ".join([f"{k}={v}" for k, v in cookies.items()])
             header_list.append(f"Cookie: {cookie_str}")
 
+        if is_sfanytime:
+            # Add specific sfanytime headers
+            header_list.extend([
+                "Accept: */*",
+                "Sec-Fetch-Dest: empty",
+                "Sec-Fetch-Mode: cors",
+                "Sec-Fetch-Site: cross-site"
+            ])
+            if token:
+                header_list.append(f"X-Axinom-DRM-Token: {token}")
+
         if is_ruutu:
             # High-stealth browser imitation for Ruutu (Nelonen)
             # Add token first to ruutu_headers (before the duplicate check later)
@@ -150,6 +189,9 @@ class Downloader:
                 ruutu_headers.append(f"X-AxDRM-Message: {token}")
             ruutu_headers.append("Referer: https://www.ruutu.fi/")
             for h in ruutu_headers:
+                cmd.extend(["-H", h])
+        elif is_viaplay:
+            for h in viaplay_headers:
                 cmd.extend(["-H", h])
         else:
             for h in header_list:

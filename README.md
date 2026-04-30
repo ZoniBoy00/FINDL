@@ -1,8 +1,8 @@
 # FINDL - Finnish Stream Downloader
 
-Unified video downloader for Finnish streaming services, specializing in **MTV Katsomo**, **Ruutu**, **Yle Areena**, and **Viaplay**.
+Unified video downloader for Finnish streaming services, specializing in **MTV Katsomo**, **Ruutu**, **Yle Areena**, **SF Anytime**, and **Viaplay**.
 
-Built with **Python**, utilizing **Playwright** for intelligent extraction, **N_m3u8DL-RE** for high-performance downloading, and **yt-dlp** for specialized HLS/DASH services.
+Built with **Python**, utilizing **Playwright** for intelligent extraction and **N_m3u8DL-RE** for high-performance downloading.
 
 **Version: 0.0.3**
 
@@ -63,40 +63,55 @@ Built with **Python**, utilizing **Playwright** for intelligent extraction, **N_
 - Windows-optimized "Temp-and-Move" strategy
 - yt-dlp integration for HLS/DASH
 
-#### Viaplay (WIP)
-- Experimental support
+#### Viaplay
+- Full video & audio in highest quality
+- DRM handling via thePlatform/Widevine (multi-strategy key acquisition)
+- Series & season support via Viaplay Content API
+- Batch episode downloading with smart sequencing
 - SAMI to SRT subtitle conversion
-- Series discovery via Playwright
+- CDN routing optimization (cdn7)
+- Concurrent stream slot management
+- Smart metadata extraction (title, season, episode) from API
+
+#### SF Anytime
+- Movie archiving with Axinom DRM
+- Automatic license token interception
+- WidevineProxy2-style response logic
+- High-quality DASH/MPD stream support
 
 ## Project Structure
 
 ```
 findl/
 ├── __init__.py                  # Main module exports
+├── config.py                    # Centralized configuration
 ├── config/
-│   └── __init__.py              # Centralized configuration
+│   └── __init__.py              # Centralized configuration (alt)
 ├── core/
 │   ├── config.py                # DRM settings
 │   ├── downloader_config.py     # Download settings
 │   ├── drm.py                   # Widevine DRM handling
-│   ├── downloader.py            # Download logic (N_m3u8DL-RE, yt-dlp)
+│   ├── downloader.py            # Download logic (N_m3u8DL-RE)
 │   └── subtitles.py             # Subtitle management & conversion
 ├── services/
 │   ├── base.py                  # BaseExtractor with common helpers
 │   ├── katsomo/
 │   │   ├── config.py            # Service-specific settings
-│   │   └── extractor.py        # Katsomo extraction logic
+│   │   └── extractor.py         # Katsomo extraction logic
 │   ├── ruutu/
 │   │   ├── config.py
 │   │   └── extractor.py
 │   ├── yle/
 │   │   ├── config.py
 │   │   └── extractor.py
-│   └── viaplay/
+│   ├── viaplay/
+│   │   ├── config.py
+│   │   └── extractor.py
+│   └── sfanytime/
 │       ├── config.py
 │       └── extractor.py
-└── ui/
-    └── display.py               # Rich UI components
+├── ui/
+│   └── display.py               # Rich UI components
 ```
 
 ### BaseExtractor Features
@@ -186,6 +201,8 @@ Selection [all]:
 | `--title` | Manual filename |
 | `--pssh` | Manual PSSH override |
 | `--no-subs` | Skip subtitles |
+| `--keys` | Manual DRM keys (format: `kid:key`, repeatable) |
+| `--key-file` | File containing DRM keys (one `kid:key` per line) |
 
 ### Naming Examples
 
@@ -196,7 +213,7 @@ Selection [all]:
 | Bulk Download | `downloads/SeriesName/Season 4/` |
 
 ### Download Speed
-- **Optimized**: Uses 64 concurrent threads for maximum speed
+- **Optimized**: Uses 16 concurrent threads for maximum speed
 - **Typical**: 10-70 MB/s depending on network and CDN
 
 ## Configuration
@@ -245,25 +262,30 @@ logging.basicConfig(level=logging.DEBUG)
 ## Architecture
 
 ```
-┌─────────────────────────────────────────┐
-│              main.py                    │
-│         (CLI & orchestration)           │
-└──────────────┬──────────────────────────┘
-              │
-     ┌──────────┼──────────┐
-     ▼          ▼          ▼
-┌───────┐ ┌───────┐ ┌────────┐
-│Katsomo│ │ Ruutu │ │  Yle   │ ... Extractors
-│   │   │ │   │   │ │   │    │
-│ └──┬──┘ │ └──┬──┘ │ └──┬───┘
-│    ▼    │    ▼    ▼    │
-│  BaseExtractor (shared helpers)          │
-└────┬────┴────┬────┴─────┬────────────────┘
-     ▼         ▼          ▼
-┌────────┐ ┌────────┐ ┌─────────┐
-│DRMHandler│ │Downloader│ │UI Display│
-│(Widevine)│ │(N_m3u8DL)│ │ (Rich)   │
-└─────────┘ └─────────┘ └──────────┘
+┌──────────────────────────────────────────────────┐
+│                    main.py                       │
+│              (CLI & orchestration)                │
+└──────────────────────┬───────────────────────────┘
+                       │
+     ┌─────────┬───────┼───────┬──────────┐
+     ▼         ▼       ▼       ▼          ▼
+┌────────┐┌───────┐┌──────┐┌────────┐┌──────────┐
+│Katsomo ││ Ruutu ││ Yle  ││Viaplay ││SF Anytime│
+└───┬────┘└───┬───┘└──┬───┘└───┬────┘└────┬─────┘
+    └─────────┴───────┴────────┴──────────┘
+                      │
+          ┌───────────┴───────────┐
+          ▼                       ▼
+   BaseExtractor            SubtitleManager
+   (shared helpers)         (VTT/SAMI→SRT)
+          │
+    ┌─────┼──────────┐
+    ▼     ▼          ▼
+┌────────┐┌─────────┐┌──────────┐
+│  DRM   ││Download ││    UI    │
+│Handler ││  er     ││ Display  │
+│(WV/TP) ││(N_m3u8) ││ (Rich)   │
+└────────┘└─────────┘└──────────┘
 ```
 
 ## Disclaimer

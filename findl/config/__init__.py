@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 APP_NAME = "FINDL"
-APP_VERSION = "0.0.2"
+APP_VERSION = "0.0.3"
 APP_AUTHOR = "ZoniBoy00"
 
 BASE_DIR = os.getcwd()
