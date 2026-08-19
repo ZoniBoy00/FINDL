@@ -558,7 +558,9 @@ def process_single_url(url, extractor, output, title, pssh, no_subs, subfolder=N
     UI.print_step(f"Starting downloader for {final_title}", "running")
     # Select best engine for the service/encryption
     is_yle = "areena.yle.fi" in url.lower()
-    use_ytdlp = False  # Use N_m3u8DL-RE for all services
+    # Use the already extracted Yle manifest directly. Re-fetching the
+    # original Areena page through yt-dlp can trigger HTTP 403 responses.
+    use_ytdlp = False
 
     logging.info(f"[MAIN] Strategy select: {'yt-dlp' if use_ytdlp else 'N_m3u8DL-RE'}")
     
@@ -588,3 +590,4 @@ def process_single_url(url, extractor, output, title, pssh, no_subs, subfolder=N
 
 if __name__ == "__main__":
     main()
+
