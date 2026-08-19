@@ -63,12 +63,11 @@ class UI:
             console.print(Panel("[bold red]No decryption keys found![/bold red]", border_style="red"))
             return
 
-        key_text = Text()
-        for i, key in enumerate(keys):
-            key_text.append(f"  🔑 Key {i+1}: ", style="bold white")
-            key_text.append(f"{key}\n", style="bold green")
-            
-        console.print(Panel(key_text, title=f"[bold green]Decryption Keys ({len(keys)})[/bold green]", border_style="green", box=ROUNDED))
+        console.print(Panel(
+            f"[bold green]{len(keys)} decryption key(s) loaded[/bold green]\n"
+            "Keys are hidden from the console and log files.",
+            title="[bold green]Decryption Keys[/bold green]", border_style="green", box=ROUNDED
+        ))
 
     @staticmethod
     def download_session(title, output, keys, subs):

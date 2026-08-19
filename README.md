@@ -6,6 +6,8 @@ Built with **Python**, utilizing **Playwright** for intelligent extraction and *
 
 **Version: 0.0.3**
 
+This development version includes runtime validation, safer logging, resumable temporary downloads, and consistent metadata-based filenames across supported services.
+
 ## Features
 
 ### Smart Naming Convention
@@ -161,6 +163,30 @@ pip install -r requirements.txt
 
 # Install Playwright browsers
 playwright install chromium
+```
+
+### Runtime checks
+
+FINDL checks its Python modules and required external tools before starting a download. Configure paths in `.env` when the binaries are not located in `bin/`:
+
+```env
+OUTPUT_DIR=downloads
+WVD_PATH=device.wvd
+NM3U8DL_RE_PATH=bin/N_m3u8DL-RE.exe
+SHAKA_PACKAGER_PATH=bin/packager-win-x64.exe
+```
+
+Run commands from any directory; project-relative paths are resolved from the FINDL installation directory. If a download fails, temporary files are retained so the downloader can resume using the same title on the next attempt.
+
+FINDL resolves media names in this order: service metadata title, page/extractor title, and finally the URL slug. Generic provider titles such as `Viaplay`, `Ruutu`, `Yle Areena`, and `Video` are ignored. Decryption keys, cookies, bearer tokens and license tokens are hidden from the console and application logs.
+
+### Tests
+
+Install the development test runner and run:
+
+```bash
+pip install pytest
+pytest -q
 ```
 
 ## Usage

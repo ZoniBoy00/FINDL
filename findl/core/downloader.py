@@ -65,7 +65,7 @@ class Downloader:
         """Standard download strategy using N_m3u8DL-RE."""
         clean_title = self._sanitize_title(title)
         ts = int(time.time())
-        temp_title = f"fndl_{ts}"
+        temp_title = f"fndl_{self._sanitize_title(title)}"
         
         # Determine service-specific origin & referer
         is_ruutu = "ruutu.fi" in manifest_url.lower() or "nelonenmedia" in manifest_url.lower()
@@ -154,7 +154,6 @@ class Downloader:
             "--save-name", temp_title,
             "--save-dir", rel_output,
             "--tmp-dir", download_tmp,
-            "--del-after-done",
             "--auto-subtitle-fix", "True",
             "--no-log",
             "--check-segments-count", "False"
@@ -219,7 +218,7 @@ class Downloader:
         # Final execution
         logging.info(f"[DOWNLOADER] Running N_m3u8DL-RE engine...")
         try:
-            subprocess.run(cmd, check=False)
+            result = subprocess.run(cmd, check=False)
             
             final_path = os.path.join(self.output_dir, f"{clean_title}.mkv")
             temp_file = os.path.join(self.output_dir, f"{temp_title}.mkv")
@@ -232,12 +231,14 @@ class Downloader:
                 logging.info(f"[DOWNLOADER] Saved to: {final_path}")
                 # Optional: extra cleanup or post-processing could go here
                 return True
+            logging.warning("[DOWNLOADER] Download did not complete (exit code %s). Temporary files were kept for resume.", result.returncode)
             return False
         except Exception as e:
             logging.error(f"[DOWNLOADER] RE Strategy failed: {e}")
             return False
         finally:
-            shutil.rmtree(download_tmp, ignore_errors=True)
+            if 'final_path' in locals() and os.path.exists(final_path):
+                shutil.rmtree(download_tmp, ignore_errors=True)
 
     def download_ytdlp(self, url, title, origin, skip_subs=False, cookies=None, license_headers=None, original_url=None):
         """
