@@ -72,8 +72,8 @@ class YleExtractor(BaseExtractor):
         title = None
         with sync_playwright() as p:
             context = p.chromium.launch_persistent_context(
-                SESSION_DIR, headless=False, channel="chrome", user_agent=CHROME_UA,
-                args=["--start-maximized", "--lang=fi-FI,fi"]
+                SESSION_DIR, headless=True, channel="chrome", user_agent=CHROME_UA,
+                args=["--lang=fi-FI,fi"]
             )
             page = context.pages[0] if context.pages else context.new_page()
             self._add_anti_detection(page)
