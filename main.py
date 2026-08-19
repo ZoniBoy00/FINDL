@@ -8,6 +8,8 @@ from rich.table import Table
 from rich.box import ROUNDED
 
 from findl.services.base import sanitize_path_name
+from findl.core.runtime import redact_message, runtime_report
+from findl.core.naming import format_series_title as _format_series_title, get_folder_structure as _get_folder_structure, title_from_url, is_generic_title
 
 def format_series_title(info, ep=None):
     """
@@ -92,6 +94,10 @@ def get_folder_structure(info, ep=None):
     
     return None
 
+# Canonical naming logic lives outside the CLI module.
+format_series_title = _format_series_title
+get_folder_structure = _get_folder_structure
+
 # Local Imports
 from findl import KatsomoExtractor, RuutuExtractor, YleExtractor, ViaplayExtractor, SfAnytimeExtractor, DRMHandler, Downloader
 
@@ -112,6 +118,15 @@ logging.basicConfig(
     ]
 )
 
+class _SecretFilter(logging.Filter):
+    def filter(self, record):
+        record.msg = redact_message(str(record.msg))
+        record.args = ()
+        return True
+
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_SecretFilter())
+
 @click.command()
 @click.argument('url', required=False)
 @click.option('--output', default='downloads', help='Output directory')
@@ -124,6 +139,10 @@ def main(url, output, title, pssh, no_subs, keys, key_file):
     """FINDL - Ultimate Video Downloader for Finnish Services"""
     
     UI.banner()
+    missing = [f"{name} ({detail})" for name, ok, detail in runtime_report() if not ok]
+    if missing:
+        UI.error("Runtime checks failed:\n  - " + "\n  - ".join(missing))
+        return
     
     if not url:
         UI.error("Please provide a URL to download.")
@@ -144,8 +163,7 @@ def main(url, output, title, pssh, no_subs, keys, key_file):
     # Manual keys provided via --keys option or --key-file
     if all_keys:
         UI.print_step(f"Using manually provided keys: {len(all_keys)}", "info")
-        for k in all_keys:
-            UI.print_step(f"  Key: {k}", "info")
+        UI.print_step("Manual decryption keys loaded (values hidden).", "info")
         
         # Extract info but skip DRM
         extractor = None
@@ -516,7 +534,7 @@ def process_single_url(url, extractor, output, title, pssh, no_subs, subfolder=N
                 break
             if ':' in key_input:
                 manual_keys.append(key_input)
-                UI.print_step(f"Added: {key_input[:20]}...", "success")
+                UI.print_step("Key added (value hidden).", "success")
         
         if not manual_keys:
             UI.error("No keys provided. Download cancelled.")
@@ -525,7 +543,9 @@ def process_single_url(url, extractor, output, title, pssh, no_subs, subfolder=N
         keys = manual_keys
         UI.key_panel(keys)
 
-    # Download Setup
+    # Download Setup: metadata first, URL slug only as a generic-title fallback.
+    if is_generic_title(info.get("title")):
+        info["title"] = title_from_url(url)
     final_title = title
     if not final_title:
         final_title = format_series_title(info)

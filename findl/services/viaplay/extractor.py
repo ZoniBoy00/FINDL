@@ -596,6 +596,14 @@ class ViaplayExtractor(BaseExtractor):
                 slug = url.rstrip("/").split("/")[-1]
                 if slug: result["title"] = slug
 
+            # Never use the provider name as the media filename. Some Viaplay
+            # player responses expose only a generic page title.
+            generic_titles = {"viaplay", "viaplay sarja", "viaplay - katso"}
+            if str(result.get("title") or "").strip().lower() in generic_titles:
+                url_slug = url.rstrip("/").split("/")[-1]
+                if url_slug and url_slug.lower() not in generic_titles:
+                    result["title"] = re.sub(r"[-_]+", " ", url_slug)
+
             if result["title"]:
                 result["title"] = re.sub(r'[^\w\s-]', '', result["title"]).strip().replace(" ", "_")
 
@@ -701,4 +709,3 @@ class ViaplayExtractor(BaseExtractor):
 
             context.close()
             return result
-
