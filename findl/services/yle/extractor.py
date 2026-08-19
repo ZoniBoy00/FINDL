@@ -2,7 +2,12 @@ import os
 import yt_dlp
 import logging
 import re
-import requests
+import shutil
+import subprocess
+import json
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 from playwright.sync_api import sync_playwright
 from findl.services.base import BaseExtractor
 from findl.config import CHROME_UA, SESSION_DIR
@@ -11,6 +16,158 @@ from findl.ui.display import UI
 class YleExtractor(BaseExtractor):
     def get_service_name(self):
         return "Yle Areena"
+
+    def _extract_with_yle_dl(self, url):
+        """Use yle-dl's stream selection when it is installed."""
+        executable = shutil.which("yle-dl")
+        if not executable:
+            return None
+        try:
+            result = subprocess.run(
+                [executable, "--showurl", url],
+                capture_output=True, text=True, timeout=90, check=False,
+            )
+            if result.returncode != 0:
+                logging.warning("[YLE] yle-dl stream lookup failed (exit %s)", result.returncode)
+                return None
+            manifest = next((line.strip() for line in result.stdout.splitlines()
+                             if ".m3u8" in line or ".mpd" in line), None)
+            if manifest:
+                logging.info("[YLE] Stream selected through yle-dl")
+                return {"title": None, "manifest_url": manifest}
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logging.warning("[YLE] yle-dl lookup unavailable: %s", exc)
+        return None
+
+    def _extract_from_player_api(self, url):
+        """Read Yle's signed preview metadata endpoint (yle-dl's method)."""
+        match = re.search(r"areena\.yle\.fi/(\d-\d+)", url)
+        if not match:
+            return None
+        endpoint = f"https://player.api.yle.fi/v1/preview/{match.group(1)}.json"
+        params = {
+            "language": "fin", "ssl": "true", "countryCode": "FI",
+            "host": "areenaylefi", "app_id": "player_static_prod",
+            "app_key": "8930d72170e48303cf5f3867780d549b",
+            "isPortabilityRegion": "true",
+        }
+        try:
+            request_url = f"{endpoint}?{urlencode(params)}"
+            request = Request(request_url, headers={"User-Agent": CHROME_UA})
+            with urlopen(request, timeout=30) as response:
+                data = json.loads(response.read().decode("utf-8")).get("data", {}).get("ongoing_ondemand", {})
+            manifest = data.get("manifest_url")
+            if not manifest:
+                return None
+            title = (data.get("title") or {}).get("fin") or (data.get("title") or {}).get("swe")
+            logging.info("[YLE] Signed manifest selected through player API")
+            return {"title": title, "manifest_url": manifest}
+        except (HTTPError, URLError, TimeoutError, ValueError, AttributeError, OSError) as exc:
+            logging.warning("[YLE] Player API lookup failed: %s", exc)
+        return None
+
+    def _extract_with_browser(self, url):
+        """Fallback for signed Yle HLS URLs that yt-dlp cannot probe."""
+        manifests = []
+        title = None
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                SESSION_DIR, headless=True, channel="chrome", user_agent=CHROME_UA,
+                args=["--lang=fi-FI,fi"]
+            )
+            page = context.pages[0] if context.pages else context.new_page()
+            self._add_anti_detection(page)
+
+            def capture(response):
+                response_url = response.url
+                if ".m3u8" in response_url and response_url not in manifests:
+                    manifests.append(response_url)
+
+            page.on("response", capture)
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            # Yle places the player behind a consent dialog on a fresh
+            # persistent profile. Accept the least surprising option so the
+            # player can initialize and expose its signed manifest request.
+            for consent_text in ("Vain välttämättömät", "Hyväksy kaikki"):
+                try:
+                    consent = page.get_by_role("button", name=consent_text)
+                    if consent.count():
+                        consent.first.click(timeout=3000)
+                        page.wait_for_timeout(1000)
+                        break
+                except Exception:
+                    pass
+            try:
+                title = page.locator("meta[property='og:title']").get_attribute("content")
+            except Exception:
+                title = None
+            # Start playback automatically. On Yle the signed media request
+            # is created only after the visible player action is triggered.
+            for play_name in ("Toista", "Katso", "Play"):
+                try:
+                    play_button = page.get_by_role("button", name=re.compile(play_name, re.I))
+                    if await_count := play_button.count():
+                        play_button.first.click(timeout=3000)
+                        page.wait_for_timeout(1500)
+                        break
+                except Exception:
+                    pass
+            # Fetch the same signed manifest that the Areena player uses,
+            # from the page context. This preserves Yle's browser session and
+            # avoids Python-side CDN/API restrictions.
+            try:
+                api_manifest = page.evaluate("""async () => {
+                    const match = location.pathname.match(/(\\d-\\d+)/);
+                    if (!match) return null;
+                    const params = new URLSearchParams({
+                      language: 'fin', ssl: 'true', countryCode: 'FI',
+                      host: 'areenaylefi', app_id: 'player_static_prod',
+                      app_key: '8930d72170e48303cf5f3867780d549b',
+                      isPortabilityRegion: 'true'
+                    });
+                    const response = await fetch(
+                      `https://player.api.yle.fi/v1/preview/${match[1]}.json?${params}`
+                    );
+                    if (!response.ok) return null;
+                    return (await response.json())?.data?.ongoing_ondemand?.manifest_url || null;
+                }""")
+                if api_manifest and api_manifest not in manifests:
+                    manifests.insert(0, api_manifest)
+                    logging.info("[YLE] Browser selected signed player API manifest")
+            except Exception as exc:
+                logging.debug("[YLE] Browser player API lookup unavailable: %s", exc)
+            page.wait_for_timeout(5000)
+            try:
+                video = page.locator("video").first
+                if video.count():
+                    video.click(timeout=3000)
+            except Exception:
+                pass
+            try:
+                page.evaluate("document.querySelector('video')?.play()")
+            except Exception:
+                pass
+            page.wait_for_timeout(15000)
+            context.close()
+
+        if not manifests:
+            logging.error("[YLE] Browser fallback did not observe an HLS manifest")
+            return None
+        master = next((item for item in manifests if re.search(r"/index\.m3u8(?:\?|$)", item, re.I)), None)
+        if not master:
+            master = next((item for item in manifests if "master" in item.lower() or "playlist" in item.lower()), None)
+        if not master:
+            master = next((item for item in manifests if not re.search(r"/index_\d+\.m3u8(?:\?|$)", item, re.I)), None)
+        # Yle's player can request only one rendition (for example
+        # index_2.m3u8). The signed Akamai path also exposes the parent
+        # master under index.m3u8, which is needed for the audio track.
+        if not master:
+            variant = manifests[0]
+            candidate = re.sub(r"/index_\d+(\.m3u8(?:\?.*)?)$", r"/index\1", variant, flags=re.I)
+            master = candidate if candidate != variant else variant
+            logging.info("[YLE] Using derived master manifest for audio/video selection")
+        logging.info(f"[YLE] Browser fallback captured manifest ({len(manifests)} candidate(s))")
+        return {"title": title, "manifest_url": master}
 
     def is_series(self, url):
         """Checks if the URL is a series/playlist page."""
@@ -194,10 +351,38 @@ class YleExtractor(BaseExtractor):
             logging.error(f"[YLE] Invalid URL: {url}")
             return None
 
+        api_result = self._extract_from_player_api(url)
+        yle_dl_result = api_result or self._extract_with_yle_dl(url)
+        if yle_dl_result:
+            yle_dl_result.update({
+                "subtitles": [], "cookies": {}, "license_url": None,
+                "license_headers": {}, "psshs": [], "pssh": None,
+                "origin": "https://areena.yle.fi", "series": None,
+                "season": None, "episode": None, "is_movie": True,
+            })
+            return yle_dl_result
+
+        # Prefer the browser-context API before yt-dlp. Yle's CDN signs the
+        # manifest for the active browser session, while yt-dlp can return a
+        # stale hdntl rendition that N_m3u8DL-RE receives as HTTP 403.
+        browser_result = self._extract_with_browser(url)
+        if browser_result and browser_result.get("manifest_url"):
+            browser_result.update({
+                "subtitles": [], "cookies": {}, "license_url": None,
+                "license_headers": {}, "psshs": [], "pssh": None,
+                "origin": "https://areena.yle.fi", "series": None,
+                "season": None, "episode": None, "is_movie": True,
+            })
+            return browser_result
+
         # Mimic a real browser to prevent "Connection aborted" or "Remote disconnected"
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
+            # Yle can return signed HLS variants that reject yt-dlp's
+            # preliminary format probe with 403 even though the manifest
+            # itself is usable by the downloader.
+            'check_formats': False,
             'user_agent': CHROME_UA,
             'http_headers': {
                 'User-Agent': CHROME_UA,
@@ -237,6 +422,17 @@ class YleExtractor(BaseExtractor):
                 "episode": None,
                 "is_movie": True
             }
+
+            # yt-dlp may return a single video rendition (index_2.m3u8).
+            # Yle's signed path also has the parent master manifest, which
+            # is required to discover and mux the audio rendition.
+            if result["manifest_url"]:
+                result["manifest_url"] = re.sub(
+                    r"/index_\d+(\.m3u8(?:\?.*)?)$",
+                    r"/index\1",
+                    result["manifest_url"],
+                    flags=re.I,
+                )
 
             # If yt-dlp didn't find manifest in 'url', check 'formats'
             if not result["manifest_url"] and info.get('formats'):
@@ -281,5 +477,16 @@ class YleExtractor(BaseExtractor):
             return result
 
         except Exception as e:
+            logging.warning(f"[YLE] yt-dlp extraction failed, trying browser manifest fallback: {e}")
+            fallback = self._extract_with_browser(url)
+            if fallback and fallback.get("manifest_url"):
+                fallback.update({
+                    "subtitles": [], "cookies": {}, "license_url": None,
+                    "license_headers": {}, "psshs": [], "pssh": None,
+                    "origin": "https://areena.yle.fi", "series": None,
+                    "season": None, "episode": None, "is_movie": True,
+                })
+                return fallback
             logging.error(f"[YLE] Extraction error: {e}")
             return None
+

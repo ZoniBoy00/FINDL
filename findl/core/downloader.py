@@ -11,7 +11,7 @@ from rich.progress import (
     DownloadColumn, TransferSpeedColumn, TimeRemainingColumn
 )
 
-from findl.config import NM3U8DL_RE_PATH, SHAKA_PACKAGER_PATH, TEMP_DIR, CHROME_UA, DEFAULT_HEADERS
+from findl.config import NM3U8DL_RE_PATH, SHAKA_PACKAGER_PATH, TEMP_DIR, CHROME_UA, DEFAULT_HEADERS, BASE_DIR
 from findl.ui.display import UI, console
 from findl.core.subtitles import SubtitleManager
 
@@ -42,7 +42,11 @@ class Downloader:
         # but yt-dlp is kept for specific cases or explicit requests.
         if use_ytdlp:
             # When using yt-dlp with force_generic, we MUST use the manifest URL
-            return self.download_ytdlp(url, title, origin, skip_subs, cookies, license_headers, original_url)
+            # For Yle, `url` is already the browser-signed hdnts manifest.
+            # Re-fetching the Areena page loses that signature and causes
+            # a CDN 403, so pass the manifest straight to yt-dlp/ffmpeg.
+            ytdlp_url = url
+            return self.download_ytdlp(ytdlp_url, title, origin, skip_subs, cookies, license_headers, original_url)
         
         # Override origin for Yle if needed
         actual_origin = origin
@@ -260,11 +264,11 @@ class Downloader:
                     ydl_headers[k] = v
 
         ydl_opts = {
-            'format': 'bestvideo+bestaudio/best',
+            'format': 'bestvideo*+bestaudio/best',
             'outtmpl': work_tmpl,
-            'quiet': True,
-            'no_warnings': True,
-            'ignoreerrors': True,
+            'quiet': False,
+            'no_warnings': False,
+            'ignoreerrors': False,
             'nocheckcertificate': True,
             'merge_output_format': 'mkv',
             'noplaylist': True,
@@ -272,7 +276,7 @@ class Downloader:
             'socket_timeout': 60,
             'retries': 10,
             'http_headers': ydl_headers,
-            'noprogress': True,
+            'noprogress': False,
             'overwrites': True,
             'nopart': True,
             'updatetime': False,
@@ -285,6 +289,30 @@ class Downloader:
                 } if 'yle' in (original_url or url).lower() else {}
             }
         }
+
+        if 'yle' in (original_url or url).lower():
+            # The 1080p Yle rendition is large enough for Akamai to close
+            # segment responses early on some connections. 720p keeps the
+            # embedded audio and is considerably more reliable.
+            ydl_opts['format'] = 'best[height<=720]/best'
+            # Yle's Akamai CDN may close a segment response before the
+            # advertised byte count is reached. ffmpeg handles reconnects
+            # more reliably than yt-dlp's native HLS reader.
+            ydl_opts['external_downloader'] = {'m3u8': 'ffmpeg'}
+            ydl_opts['hls_prefer_native'] = False
+            ffmpeg_path = os.path.join(BASE_DIR, 'bin', 'ffmpeg.exe')
+            if os.path.isfile(ffmpeg_path):
+                ydl_opts['ffmpeg_location'] = ffmpeg_path
+            ydl_opts['external_downloader_args'] = {
+                'ffmpeg_i': [
+                    '-http_seekable', '0',
+                    '-seekable', '0',
+                    '-multiple_requests', '1',
+                    '-reconnect', '1',
+                    '-reconnect_streamed', '1',
+                    '-reconnect_delay_max', '15',
+                ]
+            }
         
         if not skip_subs:
             ydl_opts['writesubtitles'] = True
@@ -376,3 +404,4 @@ class Downloader:
                 
                 try: shutil.move(os.path.join(self.output_dir, f), new_p)
                 except: pass
+
